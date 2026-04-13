@@ -1,6 +1,0 @@
-streamlit
-pandas
-openpyxl
-simple-salesforce
-truststore
-keyring
