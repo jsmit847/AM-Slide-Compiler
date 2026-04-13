@@ -1283,17 +1283,28 @@ def sanitize_filename(name: str) -> str:
 
 
 
-def load_template_bytes(uploaded_template) -> bytes:
-    if uploaded_template is not None:
-        return uploaded_template.getvalue()
-
-    default_path = Path(__file__).with_name(DEFAULT_TEMPLATE_NAME)
-    if default_path.exists():
-        return default_path.read_bytes()
-
+def resolve_repo_template_path() -> Path:
+    candidates = [
+        Path(__file__).resolve().parent / DEFAULT_TEMPLATE_NAME,
+        Path.cwd() / DEFAULT_TEMPLATE_NAME,
+        Path(__file__).resolve().parent / "templates" / DEFAULT_TEMPLATE_NAME,
+        Path.cwd() / "templates" / DEFAULT_TEMPLATE_NAME,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
     raise RuntimeError(
-        "Upload the AM template workbook, or place 'Reference AM Templates.xlsx' next to this app file."
+        "Could not find 'Reference AM Templates.xlsx'. Place it next to amslide.py, place it in a templates folder, or upload it in the app."
     )
+
+
+
+def load_template_bytes(uploaded_template) -> tuple[bytes, str]:
+    if uploaded_template is not None:
+        return uploaded_template.getvalue(), "uploaded file"
+
+    template_path = resolve_repo_template_path()
+    return template_path.read_bytes(), str(template_path)
 
 
 
@@ -1446,7 +1457,7 @@ def main() -> None:
 
             occupancy_pivot, period_labels, occupancy_debug = build_occupancy_lookup(berkadia_file.getvalue())
             term_rows_with_occ = add_occupancy_to_term_rows(term_rows, occupancy_pivot, period_labels)
-            template_bytes = load_template_bytes(template_file)
+            template_bytes, template_source = load_template_bytes(template_file)
             workbook_bytes, workbook_name = build_workbook_bytes(
                 template_bytes,
                 term_rows_with_occ,
@@ -1461,6 +1472,7 @@ def main() -> None:
             st.session_state["period_labels"] = period_labels
             st.session_state["workbook_bytes"] = workbook_bytes
             st.session_state["workbook_name"] = workbook_name
+            st.session_state["template_source"] = template_source
             st.session_state["match_count"] = (
                 int(term_rows_with_occ["Occupancy Matched"].fillna(False).sum())
                 if "Occupancy Matched" in term_rows_with_occ.columns
@@ -1478,6 +1490,7 @@ def main() -> None:
     occupancy_debug = st.session_state.get("occupancy_debug")
     workbook_bytes = st.session_state.get("workbook_bytes")
     workbook_name = st.session_state.get("workbook_name")
+    template_source = st.session_state.get("template_source")
 
     if workbook_bytes:
         metric_col1, metric_col2 = st.columns(2)
@@ -1485,6 +1498,9 @@ def main() -> None:
             st.metric("Term loans", st.session_state.get("term_count", 0))
         with metric_col2:
             st.metric("Term loans with occupancy match", st.session_state.get("match_count", 0))
+
+        if template_source:
+            st.caption(f"Template source: {template_source}")
 
         st.download_button(
             "Download completed AM slide (Excel)",
