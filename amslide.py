@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import io
+import json
 import re
 from copy import copy
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import pandas as pd
 import streamlit as st
@@ -222,73 +226,159 @@ def classify_term_bridge(df_all: pd.DataFrame):
 # -------------------------
 # Salesforce connection
 # -------------------------
-def connect_salesforce(
-    connection_mode: str,
-    instance_url: str | None = None,
-    access_token: str | None = None,
-    username: str | None = None,
-    password: str | None = None,
-    security_token: str | None = None,
-    domain: str = "login",
-) -> Salesforce:
-    install_truststore()
-
-    secrets_section = {}
+def load_salesforce_oauth_config() -> dict[str, str]:
     try:
-        if "salesforce" in st.secrets:
-            secrets_section = dict(st.secrets["salesforce"])
+        secrets_section = dict(st.secrets.get("salesforce", {}))
     except Exception:
         secrets_section = {}
 
-    if connection_mode == "Streamlit secrets":
-        if secrets_section.get("instance_url") and secrets_section.get("access_token"):
-            return Salesforce(
-                instance_url=secrets_section["instance_url"],
-                session_id=secrets_section["access_token"],
-            )
-        if (
-            secrets_section.get("username")
-            and secrets_section.get("password")
-            and secrets_section.get("security_token")
-        ):
-            return Salesforce(
-                username=secrets_section["username"],
-                password=secrets_section["password"],
-                security_token=secrets_section["security_token"],
-                domain=secrets_section.get("domain", "login"),
-            )
+    required_keys = ["client_id", "client_secret", "auth_host", "redirect_uri"]
+    missing_keys = [key for key in required_keys if not secrets_section.get(key)]
+    if missing_keys:
         raise RuntimeError(
-            "Missing Streamlit secrets. Add either instance_url + access_token, or username + password + security_token."
+            "Missing Salesforce OAuth secrets: " + ", ".join(missing_keys)
+            + ". Add them under [salesforce] in Streamlit secrets."
         )
+    return secrets_section
 
-    if connection_mode == "Username + password + security token":
-        if not username or not password or not security_token:
-            raise RuntimeError("Enter your Salesforce username, password, and security token.")
-        return Salesforce(
-            username=username,
-            password=password,
-            security_token=security_token,
-            domain=domain or "login",
-        )
 
-    if connection_mode == "Saved OAuth token (keyring)":
+
+def build_salesforce_login_url(oauth_config: dict[str, str]) -> str:
+    auth_host = str(oauth_config["auth_host"]).rstrip("/")
+    query = urlencode(
+        {
+            "response_type": "code",
+            "client_id": oauth_config["client_id"],
+            "redirect_uri": oauth_config["redirect_uri"],
+            "scope": oauth_config.get("scope", "api refresh_token"),
+            "prompt": oauth_config.get("prompt", "login"),
+        }
+    )
+    return f"{auth_host}/services/oauth2/authorize?{query}"
+
+
+
+def exchange_salesforce_code_for_token(
+    oauth_config: dict[str, str],
+    code: str,
+) -> dict[str, Any]:
+    install_truststore()
+    auth_host = str(oauth_config["auth_host"]).rstrip("/")
+    token_url = f"{auth_host}/services/oauth2/token"
+    payload = urlencode(
+        {
+            "grant_type": "authorization_code",
+            "client_id": oauth_config["client_id"],
+            "client_secret": oauth_config["client_secret"],
+            "redirect_uri": oauth_config["redirect_uri"],
+            "code": code,
+        }
+    ).encode("utf-8")
+    request = Request(
+        token_url,
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")
+        detail = body
         try:
-            import keyring
-        except Exception as exc:
-            raise RuntimeError("keyring is not installed. Use another connection mode.") from exc
+            parsed = json.loads(body)
+            detail = parsed.get("error_description") or parsed.get("error") or body
+        except Exception:
+            pass
+        raise RuntimeError(f"Salesforce login failed: {detail}") from exc
 
-        service = secrets_section.get("service_name", "salesforce_prod_oauth")
-        keyring_instance_url = keyring.get_password(service, "instance_url")
-        keyring_access_token = keyring.get_password(service, "access_token")
-        if not keyring_instance_url or not keyring_access_token:
-            raise RuntimeError(
-                "Missing instance_url/access_token in keyring. Log in first or use another connection mode."
-            )
-        return Salesforce(instance_url=keyring_instance_url, session_id=keyring_access_token)
 
+
+def read_query_param(name: str) -> str | None:
+    value = st.query_params.get(name)
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
+
+def clear_query_params() -> None:
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+
+
+
+def clear_salesforce_session() -> None:
+    for key in [
+        "salesforce_auth",
+        "account_candidates",
+        "term_preview",
+        "bridge_preview",
+        "occupancy_debug",
+        "period_labels",
+        "workbook_bytes",
+        "workbook_name",
+        "match_count",
+        "term_count",
+    ]:
+        st.session_state.pop(key, None)
+
+
+
+def maybe_finish_salesforce_oauth(oauth_config: dict[str, str]) -> None:
+    oauth_error = read_query_param("error")
+    if oauth_error:
+        oauth_description = read_query_param("error_description") or oauth_error
+        clear_query_params()
+        raise RuntimeError(f"Salesforce login was not completed: {oauth_description}")
+
+    code = read_query_param("code")
+    if not code:
+        return
+
+    if st.session_state.get("_last_salesforce_code") == code and st.session_state.get("salesforce_auth"):
+        clear_query_params()
+        return
+
+    token_payload = exchange_salesforce_code_for_token(oauth_config, code)
+    access_token = token_payload.get("access_token")
+    instance_url = token_payload.get("instance_url")
+    if not access_token or not instance_url:
+        raise RuntimeError("Salesforce login succeeded, but no access token or instance URL was returned.")
+
+    st.session_state["salesforce_auth"] = {
+        "access_token": access_token,
+        "instance_url": instance_url,
+        "issued_at": token_payload.get("issued_at"),
+        "id_url": token_payload.get("id"),
+        "signature": token_payload.get("signature"),
+    }
+    st.session_state["_last_salesforce_code"] = code
+    clear_query_params()
+    st.rerun()
+
+
+
+def get_salesforce_client_from_session() -> Salesforce | None:
+    install_truststore()
+    auth_data = st.session_state.get("salesforce_auth", {})
+    instance_url = auth_data.get("instance_url")
+    access_token = auth_data.get("access_token")
     if not instance_url or not access_token:
-        raise RuntimeError("Enter both instance URL and access token.")
+        return None
     return Salesforce(instance_url=instance_url, session_id=access_token)
+
+
+
+def normalize_salesforce_error(exc: Exception) -> RuntimeError:
+    message = str(exc)
+    if "INVALID_SESSION_ID" in message or "Session expired" in message:
+        clear_salesforce_session()
+        return RuntimeError("Your Salesforce session expired. Click 'Log in to Salesforce' and try again.")
+    return RuntimeError(message)
 
 
 # -------------------------
@@ -863,14 +953,12 @@ def build_occupancy_lookup(berkadia_bytes: bytes, periods_to_keep: int = 4):
         row["Occupancy Source"] = "Average of property rows"
         return row
 
-    chosen_rows = []
-    for (loan_id, period_end_date), group in df.groupby(["Loan ID", "Period End Date"], dropna=False):
-        row = choose_row(group)
-        row["Loan ID"] = loan_id
-        row["Period End Date"] = period_end_date
-        chosen_rows.append(row)
+    reduced = (
+        df.groupby(["Loan ID", "Period End Date"], dropna=False, as_index=False)
+        .apply(choose_row)
+        .reset_index(drop=True)
+    )
 
-    reduced = pd.DataFrame(chosen_rows)
     recent_periods = sorted(reduced["Period End Date"].dropna().unique(), reverse=True)[:periods_to_keep]
     recent_periods = [pd.Timestamp(period) for period in recent_periods]
     period_labels = [quarter_label(period) for period in recent_periods]
@@ -1085,7 +1173,8 @@ def set_term_occupancy_headers(ws, header_row: int, col_map: dict[str, int], per
     occ_cols = [col_num for header, col_num in col_map.items() if "occ" in header]
     occ_cols = sorted(occ_cols)
     for index, col_num in enumerate(occ_cols):
-        ws.cell(header_row, col_num).value = f"{period_labels[index]} Occ%" if index < len(period_labels) else None
+        if index < len(period_labels):
+            ws.cell(header_row, col_num).value = f"{period_labels[index]} Occ%"
     return occ_cols
 
 
@@ -1283,28 +1372,23 @@ def sanitize_filename(name: str) -> str:
 
 
 
-def resolve_repo_template_path() -> Path:
-    candidates = [
+def load_template_bytes(uploaded_template) -> bytes:
+    if uploaded_template is not None:
+        return uploaded_template.getvalue()
+
+    candidate_paths = [
         Path(__file__).resolve().parent / DEFAULT_TEMPLATE_NAME,
         Path.cwd() / DEFAULT_TEMPLATE_NAME,
         Path(__file__).resolve().parent / "templates" / DEFAULT_TEMPLATE_NAME,
         Path.cwd() / "templates" / DEFAULT_TEMPLATE_NAME,
     ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
+    for candidate_path in candidate_paths:
+        if candidate_path.exists():
+            return candidate_path.read_bytes()
+
     raise RuntimeError(
         "Could not find 'Reference AM Templates.xlsx'. Place it next to amslide.py, place it in a templates folder, or upload it in the app."
     )
-
-
-
-def load_template_bytes(uploaded_template) -> tuple[bytes, str]:
-    if uploaded_template is not None:
-        return uploaded_template.getvalue(), "uploaded file"
-
-    template_path = resolve_repo_template_path()
-    return template_path.read_bytes(), str(template_path)
 
 
 
@@ -1346,190 +1430,169 @@ def format_preview(df: pd.DataFrame, period_labels: list[str]) -> pd.DataFrame:
 # -------------------------
 # Streamlit UI
 # -------------------------
-def main() -> None:
-    st.set_page_config(page_title="AM Slides Builder", layout="wide")
-    st.title("AM Slides Builder")
-    st.caption("Build the AM Slides workbook from Salesforce and a Berkadia Financial Analysis export.")
+st.set_page_config(page_title="AM Slides Builder", layout="wide")
+st.title("AM Slides Builder")
+st.caption("Build the AM Slides workbook from Salesforce and a Berkadia Financial Analysis export.")
 
-    with st.sidebar:
-        st.header("Salesforce connection")
-        connection_mode = st.radio(
-            "Connection method",
-            [
-                "Streamlit secrets",
-                "Username + password + security token",
-                "Paste instance URL + access token",
-                "Saved OAuth token (keyring)",
-            ],
-            index=0,
+oauth_config = None
+oauth_setup_error = None
+try:
+    oauth_config = load_salesforce_oauth_config()
+    maybe_finish_salesforce_oauth(oauth_config)
+except Exception as exc:
+    oauth_setup_error = str(exc)
+
+sf = None
+if oauth_setup_error is None:
+    try:
+        sf = get_salesforce_client_from_session()
+    except Exception as exc:
+        oauth_setup_error = str(exc)
+
+with st.sidebar:
+    st.header("Salesforce connection")
+    if oauth_setup_error:
+        st.error(oauth_setup_error)
+    elif sf is None:
+        st.info("Log in to Salesforce before searching for an account.")
+        st.link_button(
+            "Log in to Salesforce",
+            build_salesforce_login_url(oauth_config),
+            use_container_width=True,
         )
-        manual_instance_url = None
-        manual_access_token = None
-        username = None
-        password = None
-        security_token = None
-        sf_domain = "login"
+        st.caption(f"Callback URL in secrets: {oauth_config['redirect_uri']}")
+    else:
+        auth_data = st.session_state.get("salesforce_auth", {})
+        st.success("Connected to Salesforce")
+        if auth_data.get("instance_url"):
+            st.caption(f"Instance: {auth_data['instance_url']}")
+        if st.button("Log out of Salesforce", use_container_width=True):
+            clear_salesforce_session()
+            st.rerun()
 
-        if connection_mode == "Username + password + security token":
-            username = st.text_input("Salesforce username")
-            password = st.text_input("Salesforce password", type="password")
-            security_token = st.text_input("Salesforce security token", type="password")
-            sf_domain = st.selectbox("Salesforce domain", ["login", "test"], index=0)
-        elif connection_mode == "Paste instance URL + access token":
-            manual_instance_url = st.text_input("Instance URL")
-            manual_access_token = st.text_input("Access token", type="password")
+    st.divider()
+    st.header("Inputs")
+    berkadia_file = st.file_uploader(
+        "Upload Berkadia servicer file",
+        type=["xlsx", "xlsm"],
+        key="berkadia_file",
+        help="This should be the spreadsheet that contains the Financial Analysis sheet.",
+    )
+    template_file = st.file_uploader(
+        "Upload AM template workbook (optional)",
+        type=["xlsx", "xlsm"],
+        key="template_file",
+        help="Leave this blank if Reference AM Templates.xlsx is stored next to the app file.",
+    )
 
-        st.caption("For Streamlit Cloud, use Streamlit secrets or enter your Salesforce credentials above. Keyring is best for local desktop use.")
+search_col1, search_col2 = st.columns([1, 2])
+with search_col1:
+    search_mode = st.selectbox("Search Salesforce by", ["Account Name", "Deal Name", "Deal Loan Number"])
+with search_col2:
+    search_text = st.text_input("Search text")
 
-        st.divider()
-        st.header("Inputs")
-        berkadia_file = st.file_uploader(
-            "Upload Berkadia servicer file",
-            type=["xlsx", "xlsm"],
-            key="berkadia_file",
-            help="This should be the spreadsheet that contains the Financial Analysis sheet.",
-        )
-        template_file = st.file_uploader(
-            "Upload AM template workbook (optional)",
-            type=["xlsx", "xlsm"],
-            key="template_file",
-            help="Leave this blank if Reference AM Templates.xlsx is stored next to this app file.",
-        )
-
-    search_col1, search_col2 = st.columns([1, 2])
-    with search_col1:
-        search_mode = st.selectbox("Search Salesforce by", ["Account Name", "Deal Name", "Deal Loan Number"])
-    with search_col2:
-        search_text = st.text_input("Search text")
-
-    if st.button("Search Salesforce", type="secondary"):
-        if not search_text.strip():
-            st.error("Enter a search value first.")
-        else:
-            try:
-                sf = connect_salesforce(
-                    connection_mode,
-                    manual_instance_url,
-                    manual_access_token,
-                    username,
-                    password,
-                    security_token,
-                    sf_domain,
-                )
-                account_candidates = search_matching_accounts(sf, search_mode, search_text)
-                st.session_state["account_candidates"] = account_candidates
-                if account_candidates.empty:
-                    st.warning("No matching accounts found.")
-                else:
-                    st.success(f"Found {len(account_candidates)} matching account candidates.")
-            except Exception as exc:
-                st.error(str(exc))
-
-    account_candidates = st.session_state.get("account_candidates", pd.DataFrame())
-    selected_account = None
-    if isinstance(account_candidates, pd.DataFrame) and not account_candidates.empty:
-        st.subheader("Account candidates")
-        st.dataframe(account_candidates, use_container_width=True, hide_index=True)
-        selected_account = st.selectbox(
-            "Pick the account for the AM slide",
-            options=account_candidates["Account_Name__c"].tolist(),
-        )
-
-    if st.button("Build AM Slides workbook", type="primary"):
+if st.button("Search Salesforce", type="secondary"):
+    if sf is None:
+        st.error("Log in to Salesforce first.")
+    elif not search_text.strip():
+        st.error("Enter a search value first.")
+    else:
         try:
-            if not selected_account:
-                raise RuntimeError("Search Salesforce and choose an account first.")
-            if berkadia_file is None:
-                raise RuntimeError("Upload the Berkadia servicer file first.")
-
-            sf = connect_salesforce(
-                connection_mode,
-                manual_instance_url,
-                manual_access_token,
-                username,
-                password,
-                security_token,
-                sf_domain,
-            )
-            term_rows, bridge_rows = build_term_bridge_for_account(sf, selected_account)
-            if term_rows.empty and bridge_rows.empty:
-                raise RuntimeError("No term or bridge rows were returned for the selected account.")
-
-            occupancy_pivot, period_labels, occupancy_debug = build_occupancy_lookup(berkadia_file.getvalue())
-            term_rows_with_occ = add_occupancy_to_term_rows(term_rows, occupancy_pivot, period_labels)
-            template_bytes, template_source = load_template_bytes(template_file)
-            workbook_bytes, workbook_name = build_workbook_bytes(
-                template_bytes,
-                term_rows_with_occ,
-                bridge_rows,
-                selected_account,
-                period_labels,
-            )
-
-            st.session_state["term_preview"] = format_preview(term_rows_with_occ, period_labels)
-            st.session_state["bridge_preview"] = bridge_rows
-            st.session_state["occupancy_debug"] = occupancy_debug
-            st.session_state["period_labels"] = period_labels
-            st.session_state["workbook_bytes"] = workbook_bytes
-            st.session_state["workbook_name"] = workbook_name
-            st.session_state["template_source"] = template_source
-            st.session_state["match_count"] = (
-                int(term_rows_with_occ["Occupancy Matched"].fillna(False).sum())
-                if "Occupancy Matched" in term_rows_with_occ.columns
-                else 0
-            )
-            st.session_state["term_count"] = len(term_rows_with_occ)
-
-            st.success("AM Slides workbook is ready.")
+            account_candidates = search_matching_accounts(sf, search_mode, search_text)
+            st.session_state["account_candidates"] = account_candidates
+            if account_candidates.empty:
+                st.warning("No matching accounts found.")
+            else:
+                st.success(f"Found {len(account_candidates)} matching account candidates.")
         except Exception as exc:
-            st.error(str(exc))
+            st.error(str(normalize_salesforce_error(exc)))
 
-    period_labels = st.session_state.get("period_labels", [])
-    term_preview = st.session_state.get("term_preview")
-    bridge_preview = st.session_state.get("bridge_preview")
-    occupancy_debug = st.session_state.get("occupancy_debug")
-    workbook_bytes = st.session_state.get("workbook_bytes")
-    workbook_name = st.session_state.get("workbook_name")
-    template_source = st.session_state.get("template_source")
+account_candidates = st.session_state.get("account_candidates", pd.DataFrame())
+selected_account = None
+if isinstance(account_candidates, pd.DataFrame) and not account_candidates.empty:
+    st.subheader("Account candidates")
+    st.dataframe(account_candidates, use_container_width=True, hide_index=True)
+    selected_account = st.selectbox(
+        "Pick the account for the AM slide",
+        options=account_candidates["Account_Name__c"].tolist(),
+    )
 
-    if workbook_bytes:
-        metric_col1, metric_col2 = st.columns(2)
-        with metric_col1:
-            st.metric("Term loans", st.session_state.get("term_count", 0))
-        with metric_col2:
-            st.metric("Term loans with occupancy match", st.session_state.get("match_count", 0))
+if st.button("Build AM Slides workbook", type="primary"):
+    try:
+        if sf is None:
+            raise RuntimeError("Log in to Salesforce first.")
+        if not selected_account:
+            raise RuntimeError("Search Salesforce and choose an account first.")
+        if berkadia_file is None:
+            raise RuntimeError("Upload the Berkadia servicer file first.")
 
-        if template_source:
-            st.caption(f"Template source: {template_source}")
+        term_rows, bridge_rows = build_term_bridge_for_account(sf, selected_account)
+        if term_rows.empty and bridge_rows.empty:
+            raise RuntimeError("No term or bridge rows were returned for the selected account.")
 
-        st.download_button(
-            "Download completed AM slide (Excel)",
-            data=workbook_bytes,
-            file_name=workbook_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        occupancy_pivot, period_labels, occupancy_debug = build_occupancy_lookup(berkadia_file.getvalue())
+        term_rows_with_occ = add_occupancy_to_term_rows(term_rows, occupancy_pivot, period_labels)
+        template_bytes = load_template_bytes(template_file)
+        workbook_bytes, workbook_name = build_workbook_bytes(
+            template_bytes,
+            term_rows_with_occ,
+            bridge_rows,
+            selected_account,
+            period_labels,
         )
 
-    if isinstance(term_preview, pd.DataFrame) and not term_preview.empty:
-        st.subheader("Term preview")
-        st.dataframe(term_preview, use_container_width=True, hide_index=True)
+        st.session_state["term_preview"] = format_preview(term_rows_with_occ, period_labels)
+        st.session_state["bridge_preview"] = bridge_rows
+        st.session_state["occupancy_debug"] = occupancy_debug
+        st.session_state["period_labels"] = period_labels
+        st.session_state["workbook_bytes"] = workbook_bytes
+        st.session_state["workbook_name"] = workbook_name
+        st.session_state["match_count"] = int(term_rows_with_occ["Occupancy Matched"].sum()) if not term_rows_with_occ.empty else 0
+        st.session_state["term_count"] = len(term_rows_with_occ)
 
-    if isinstance(bridge_preview, pd.DataFrame) and not bridge_preview.empty:
-        st.subheader("Bridge preview")
-        st.dataframe(bridge_preview, use_container_width=True, hide_index=True)
+        st.success("AM Slides workbook is ready.")
+    except Exception as exc:
+        st.error(str(normalize_salesforce_error(exc)))
 
-    if isinstance(occupancy_debug, pd.DataFrame) and not occupancy_debug.empty:
-        with st.expander("Occupancy lookup details"):
-            st.write(
-                "Using these period columns from the Berkadia file: " + ", ".join(period_labels)
-                if period_labels
-                else "No occupancy periods detected."
-            )
-            debug_display = occupancy_debug.copy()
-            debug_display["Occupancy Dec"] = debug_display["Occupancy Dec"].apply(
-                lambda x: "" if pd.isna(x) else f"{x:.1%}"
-            )
-            st.dataframe(debug_display, use_container_width=True, hide_index=True)
+period_labels = st.session_state.get("period_labels", [])
+term_preview = st.session_state.get("term_preview")
+bridge_preview = st.session_state.get("bridge_preview")
+occupancy_debug = st.session_state.get("occupancy_debug")
+workbook_bytes = st.session_state.get("workbook_bytes")
+workbook_name = st.session_state.get("workbook_name")
 
+if workbook_bytes:
+    metric_col1, metric_col2 = st.columns(2)
+    with metric_col1:
+        st.metric("Term loans", st.session_state.get("term_count", 0))
+    with metric_col2:
+        st.metric("Term loans with occupancy match", st.session_state.get("match_count", 0))
 
-if __name__ == "__main__":
-    main()
+    st.download_button(
+        "Download AM Slides workbook",
+        data=workbook_bytes,
+        file_name=workbook_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+if isinstance(term_preview, pd.DataFrame) and not term_preview.empty:
+    st.subheader("Term preview")
+    st.dataframe(term_preview, use_container_width=True, hide_index=True)
+
+if isinstance(bridge_preview, pd.DataFrame) and not bridge_preview.empty:
+    st.subheader("Bridge preview")
+    st.dataframe(bridge_preview, use_container_width=True, hide_index=True)
+
+if isinstance(occupancy_debug, pd.DataFrame) and not occupancy_debug.empty:
+    with st.expander("Occupancy lookup details"):
+        st.write(
+            "Using these period columns from the Berkadia file: "
+            + ", ".join(period_labels)
+            if period_labels
+            else "No occupancy periods detected."
+        )
+        debug_display = occupancy_debug.copy()
+        debug_display["Occupancy Dec"] = debug_display["Occupancy Dec"].apply(
+            lambda x: "" if pd.isna(x) else f"{x:.1%}"
+        )
+        st.dataframe(debug_display, use_container_width=True, hide_index=True)
