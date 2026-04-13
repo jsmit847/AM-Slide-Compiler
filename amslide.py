@@ -318,6 +318,7 @@ def clear_salesforce_session() -> None:
         "term_preview",
         "bridge_preview",
         "occupancy_debug",
+        "occupancy_period_summary",
         "period_labels",
         "workbook_bytes",
         "workbook_name",
@@ -894,7 +895,11 @@ def quarter_label(period_end_date: pd.Timestamp) -> str:
 
 
 
-def build_occupancy_lookup(berkadia_bytes: bytes, periods_to_keep: int = 4):
+def build_occupancy_lookup(
+    berkadia_bytes: bytes,
+    periods_to_keep: int = 4,
+    min_coverage_ratio: float = 0.25,
+):
     required_columns = [
         "Investor Loan#",
         "Consolidated?",
@@ -953,18 +958,39 @@ def build_occupancy_lookup(berkadia_bytes: bytes, periods_to_keep: int = 4):
         row["Occupancy Source"] = "Average of property rows"
         return row
 
-    reduced = (
-        df.groupby(["Loan ID", "Period End Date"], dropna=False, as_index=False)
-        .apply(choose_row)
+    reduced_rows = []
+    for _, group in df.groupby(["Loan ID", "Period End Date"], dropna=False):
+        reduced_rows.append(choose_row(group))
+    reduced = pd.DataFrame(reduced_rows)
+
+    reduced["Period Label"] = reduced["Period End Date"].apply(quarter_label)
+    period_summary = (
+        reduced.groupby(["Period Label", "Period End Date"], dropna=False)
+        .agg(
+            Loan_Count=("Loan ID", "nunique"),
+            Occupancy_Count=("Occupancy Dec", lambda s: int(s.notna().sum())),
+            Frequency_Types=(
+                "Freq of Analysis",
+                lambda s: ", ".join(sorted({str(v) for v in s if pd.notna(v) and str(v).strip() != ""})),
+            ),
+        )
+        .reset_index()
+        .sort_values(["Period End Date", "Period Label"], ascending=[False, False])
         .reset_index(drop=True)
     )
 
-    recent_periods = sorted(reduced["Period End Date"].dropna().unique(), reverse=True)[:periods_to_keep]
-    recent_periods = [pd.Timestamp(period) for period in recent_periods]
-    period_labels = [quarter_label(period) for period in recent_periods]
-    reduced = reduced[reduced["Period End Date"].isin(recent_periods)].copy()
-    reduced["Period Label"] = reduced["Period End Date"].apply(quarter_label)
+    max_coverage = int(period_summary["Occupancy_Count"].max()) if not period_summary.empty else 0
+    minimum_coverage = max(1, int(round(max_coverage * min_coverage_ratio)))
 
+    selected_summary = period_summary[period_summary["Occupancy_Count"] >= minimum_coverage].copy()
+    if len(selected_summary) < periods_to_keep:
+        selected_summary = period_summary.copy()
+    selected_summary = selected_summary.head(periods_to_keep).copy()
+
+    period_labels = selected_summary["Period Label"].tolist()
+    recent_periods = [pd.Timestamp(period) for period in selected_summary["Period End Date"].tolist()]
+
+    reduced = reduced[reduced["Period End Date"].isin(recent_periods)].copy()
     pivot = (
         reduced.pivot_table(
             index="Loan ID",
@@ -992,7 +1018,15 @@ def build_occupancy_lookup(berkadia_bytes: bytes, periods_to_keep: int = 4):
         ["Loan ID", "Period End Date"],
         ascending=[True, False],
     )
-    return pivot, period_labels, debug_df
+
+    period_summary["Selected"] = period_summary["Period Label"].isin(period_labels)
+    period_summary["Coverage Threshold"] = minimum_coverage
+    return pivot, period_labels, debug_df, period_summary
+
+
+@st.cache_data(show_spinner=False)
+def load_occupancy_lookup_cached(berkadia_bytes: bytes):
+    return build_occupancy_lookup(berkadia_bytes)
 
 
 
@@ -1372,10 +1406,7 @@ def sanitize_filename(name: str) -> str:
 
 
 
-def load_template_bytes(uploaded_template) -> bytes:
-    if uploaded_template is not None:
-        return uploaded_template.getvalue()
-
+def resolve_repo_template_path() -> Path:
     candidate_paths = [
         Path(__file__).resolve().parent / DEFAULT_TEMPLATE_NAME,
         Path.cwd() / DEFAULT_TEMPLATE_NAME,
@@ -1384,11 +1415,15 @@ def load_template_bytes(uploaded_template) -> bytes:
     ]
     for candidate_path in candidate_paths:
         if candidate_path.exists():
-            return candidate_path.read_bytes()
+            return candidate_path
 
     raise RuntimeError(
-        "Could not find 'Reference AM Templates.xlsx'. Place it next to amslide.py, place it in a templates folder, or upload it in the app."
+        "Could not find 'Reference AM Templates.xlsx' in the repository. Place it next to amslide.py or inside a templates folder in the repo."
     )
+
+
+def load_template_bytes() -> bytes:
+    return resolve_repo_template_path().read_bytes()
 
 
 
@@ -1449,52 +1484,102 @@ if oauth_setup_error is None:
     except Exception as exc:
         oauth_setup_error = str(exc)
 
+template_error = None
+template_path = None
+try:
+    template_path = resolve_repo_template_path()
+except Exception as exc:
+    template_error = str(exc)
+
 with st.sidebar:
-    st.header("Salesforce connection")
+    st.header("App status")
+    if template_error:
+        st.error(template_error)
+    elif template_path is not None:
+        st.success("Template found in repository")
+        st.caption(template_path.name)
+
+    st.divider()
+    st.header("Salesforce")
     if oauth_setup_error:
         st.error(oauth_setup_error)
     elif sf is None:
-        st.info("Log in to Salesforce before searching for an account.")
-        st.link_button(
-            "Log in to Salesforce",
-            build_salesforce_login_url(oauth_config),
-            use_container_width=True,
-        )
-        st.caption(f"Callback URL in secrets: {oauth_config['redirect_uri']}")
+        st.info("Not connected")
     else:
         auth_data = st.session_state.get("salesforce_auth", {})
-        st.success("Connected to Salesforce")
+        st.success("Connected")
         if auth_data.get("instance_url"):
-            st.caption(f"Instance: {auth_data['instance_url']}")
+            st.caption(auth_data["instance_url"])
         if st.button("Log out of Salesforce", use_container_width=True):
             clear_salesforce_session()
             st.rerun()
 
-    st.divider()
-    st.header("Inputs")
-    berkadia_file = st.file_uploader(
-        "Upload Berkadia servicer file",
-        type=["xlsx", "xlsm"],
-        key="berkadia_file",
-        help="This should be the spreadsheet that contains the Financial Analysis sheet.",
-    )
-    template_file = st.file_uploader(
-        "Upload AM template workbook (optional)",
-        type=["xlsx", "xlsm"],
-        key="template_file",
-        help="Leave this blank if Reference AM Templates.xlsx is stored next to the app file.",
-    )
+if template_error:
+    st.error(template_error)
+    st.stop()
 
+st.subheader("Step 1: Log in to Salesforce")
+if oauth_setup_error:
+    st.error(oauth_setup_error)
+    st.stop()
+
+if sf is None:
+    st.info("Log in first. After you sign in, the app will let you upload the Berkadia file and build the AM slide.")
+    st.link_button(
+        "Log in to Salesforce",
+        build_salesforce_login_url(oauth_config),
+        use_container_width=False,
+    )
+    st.caption(f"Callback URL: {oauth_config['redirect_uri']}")
+    st.stop()
+
+st.success("Salesforce login complete.")
+
+st.subheader("Step 2: Upload the Berkadia servicer file")
+st.caption("The AM template workbook is loaded automatically from the repository. You do not need to upload it here.")
+berkadia_file = st.file_uploader(
+    "Upload Berkadia servicer file",
+    type=["xlsx", "xlsm"],
+    key="berkadia_file",
+    help="Use the servicer workbook that contains the Financial Analysis sheet.",
+)
+
+if berkadia_file is None:
+    st.info("Upload the Berkadia servicer file to continue.")
+    st.stop()
+
+occupancy_pivot = None
+period_labels = []
+occupancy_debug = None
+occupancy_period_summary = None
+try:
+    occupancy_pivot, period_labels, occupancy_debug, occupancy_period_summary = load_occupancy_lookup_cached(
+        berkadia_file.getvalue()
+    )
+    selected_periods = ", ".join(period_labels) if period_labels else "none detected"
+    st.success(f"Berkadia file loaded. Using these occupancy periods: {selected_periods}")
+except Exception as exc:
+    st.error(str(exc))
+    st.stop()
+
+if isinstance(occupancy_period_summary, pd.DataFrame) and not occupancy_period_summary.empty:
+    with st.expander("Review detected occupancy periods", expanded=False):
+        summary_display = occupancy_period_summary.copy()
+        summary_display["Selected"] = summary_display["Selected"].map({True: "Yes", False: "No"})
+        st.dataframe(summary_display, use_container_width=True, hide_index=True)
+
+st.subheader("Step 3: Search Salesforce and choose an account")
 search_col1, search_col2 = st.columns([1, 2])
 with search_col1:
-    search_mode = st.selectbox("Search Salesforce by", ["Account Name", "Deal Name", "Deal Loan Number"])
+    search_mode = st.selectbox(
+        "Search Salesforce by",
+        ["Account Name", "Deal Name", "Deal Loan Number"],
+    )
 with search_col2:
     search_text = st.text_input("Search text")
 
 if st.button("Search Salesforce", type="secondary"):
-    if sf is None:
-        st.error("Log in to Salesforce first.")
-    elif not search_text.strip():
+    if not search_text.strip():
         st.error("Enter a search value first.")
     else:
         try:
@@ -1510,54 +1595,52 @@ if st.button("Search Salesforce", type="secondary"):
 account_candidates = st.session_state.get("account_candidates", pd.DataFrame())
 selected_account = None
 if isinstance(account_candidates, pd.DataFrame) and not account_candidates.empty:
-    st.subheader("Account candidates")
     st.dataframe(account_candidates, use_container_width=True, hide_index=True)
     selected_account = st.selectbox(
         "Pick the account for the AM slide",
         options=account_candidates["Account_Name__c"].tolist(),
     )
+else:
+    st.info("Search Salesforce to load the account list.")
 
-if st.button("Build AM Slides workbook", type="primary"):
+st.subheader("Step 4: Build and download the AM slide")
+build_disabled = not bool(selected_account)
+if st.button("Build completed AM slide", type="primary", disabled=build_disabled):
     try:
-        if sf is None:
-            raise RuntimeError("Log in to Salesforce first.")
-        if not selected_account:
-            raise RuntimeError("Search Salesforce and choose an account first.")
-        if berkadia_file is None:
-            raise RuntimeError("Upload the Berkadia servicer file first.")
+        with st.spinner("Building the AM slide workbook..."):
+            term_rows, bridge_rows = build_term_bridge_for_account(sf, selected_account)
+            if term_rows.empty and bridge_rows.empty:
+                raise RuntimeError("No term or bridge rows were returned for the selected account.")
 
-        term_rows, bridge_rows = build_term_bridge_for_account(sf, selected_account)
-        if term_rows.empty and bridge_rows.empty:
-            raise RuntimeError("No term or bridge rows were returned for the selected account.")
-
-        occupancy_pivot, period_labels, occupancy_debug = build_occupancy_lookup(berkadia_file.getvalue())
-        term_rows_with_occ = add_occupancy_to_term_rows(term_rows, occupancy_pivot, period_labels)
-        template_bytes = load_template_bytes(template_file)
-        workbook_bytes, workbook_name = build_workbook_bytes(
-            template_bytes,
-            term_rows_with_occ,
-            bridge_rows,
-            selected_account,
-            period_labels,
-        )
+            term_rows_with_occ = add_occupancy_to_term_rows(term_rows, occupancy_pivot, period_labels)
+            template_bytes = load_template_bytes()
+            workbook_bytes, workbook_name = build_workbook_bytes(
+                template_bytes,
+                term_rows_with_occ,
+                bridge_rows,
+                selected_account,
+                period_labels,
+            )
 
         st.session_state["term_preview"] = format_preview(term_rows_with_occ, period_labels)
         st.session_state["bridge_preview"] = bridge_rows
         st.session_state["occupancy_debug"] = occupancy_debug
+        st.session_state["occupancy_period_summary"] = occupancy_period_summary
         st.session_state["period_labels"] = period_labels
         st.session_state["workbook_bytes"] = workbook_bytes
         st.session_state["workbook_name"] = workbook_name
         st.session_state["match_count"] = int(term_rows_with_occ["Occupancy Matched"].sum()) if not term_rows_with_occ.empty else 0
         st.session_state["term_count"] = len(term_rows_with_occ)
 
-        st.success("AM Slides workbook is ready.")
+        st.success("The AM slide workbook is ready.")
     except Exception as exc:
         st.error(str(normalize_salesforce_error(exc)))
 
-period_labels = st.session_state.get("period_labels", [])
+period_labels = st.session_state.get("period_labels", period_labels)
 term_preview = st.session_state.get("term_preview")
 bridge_preview = st.session_state.get("bridge_preview")
 occupancy_debug = st.session_state.get("occupancy_debug")
+occupancy_period_summary = st.session_state.get("occupancy_period_summary", occupancy_period_summary)
 workbook_bytes = st.session_state.get("workbook_bytes")
 workbook_name = st.session_state.get("workbook_name")
 
@@ -1569,7 +1652,7 @@ if workbook_bytes:
         st.metric("Term loans with occupancy match", st.session_state.get("match_count", 0))
 
     st.download_button(
-        "Download AM Slides workbook",
+        "Download completed AM slide (Excel)",
         data=workbook_bytes,
         file_name=workbook_name,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1584,10 +1667,9 @@ if isinstance(bridge_preview, pd.DataFrame) and not bridge_preview.empty:
     st.dataframe(bridge_preview, use_container_width=True, hide_index=True)
 
 if isinstance(occupancy_debug, pd.DataFrame) and not occupancy_debug.empty:
-    with st.expander("Occupancy lookup details"):
+    with st.expander("Occupancy lookup details", expanded=False):
         st.write(
-            "Using these period columns from the Berkadia file: "
-            + ", ".join(period_labels)
+            "Using these period columns from the Berkadia file: " + ", ".join(period_labels)
             if period_labels
             else "No occupancy periods detected."
         )
