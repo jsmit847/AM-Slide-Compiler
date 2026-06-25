@@ -4,6 +4,7 @@ import io
 import json
 import re
 from copy import copy
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -11,8 +12,10 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import pandas as pd
+import requests
 import streamlit as st
 from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 from simple_salesforce import Salesforce
 
 TERM_SHEET = "Term"
@@ -33,6 +36,40 @@ BRIDGE_DEV_EXACT = {"single_asset_bridge_loan"}
 BRIDGE_DEV_CONTAINS = {"single_asset_bridge", "sab"}
 
 DC_DEAL_FIELD = "Deal__c"
+
+# Occupancy selection tuning (matches the notebook).
+EXPECTED_FREQ_BY_QTR = {1: "Q1", 2: "Q2", 3: "Q3", 4: "AN"}
+EXPECTED_MONTHS_BY_QTR = {1: 3, 2: 6, 3: 9, 4: 12}
+CANONICAL_FREQS = {"Q1", "Q2", "Q3", "AN"}
+
+# FCI Bridge late-payment / late-charge check settings.
+FCI_URL = "https://fapi.myfci.com/graphql"
+FCI_TIMEOUT_SECONDS = 45
+FCI_ALERT_SHEET = "FCI Bridge Alerts"
+# Used only for FCI matching. Stripped from the public bridge_rows before display/write.
+FCI_INTERNAL_BRIDGE_COLUMNS = [
+    "Opportunity Id",
+    "Deal Loan Number Raw",
+    "Servicer Commitment ID",
+    "Property Servicer IDs",
+]
+FCI_LOAN_FIELDS = [
+    "loanAccount",
+    "nextDueDate",
+    "paidToDate",
+    "paidOffDate",
+    "principalBalance",
+    "status",
+    "statusLender",
+    "lateChargesDays",
+    "lateChargesPct",
+    "unpaidLateCharges",
+    "unpaidLateChargesWaived",
+    "deferredLateCharges",
+    "poffAcurredLateCharges",
+    "poffUnpaidLateCharges",
+    "poffPaidLateCharges",
+]
 
 
 # -------------------------
@@ -63,6 +100,12 @@ def last5_strip_prefix(value: Any) -> str:
     if digits.startswith("4030") or digits.startswith("6000"):
         digits = digits[4:]
     return digits[-5:] if len(digits) >= 5 else digits
+
+
+
+def loan_id_5(value: Any) -> str:
+    digits = last5_strip_prefix(value)
+    return str(digits).zfill(5) if str(digits).strip() else ""
 
 
 
@@ -317,13 +360,16 @@ def clear_salesforce_session() -> None:
         "account_candidates",
         "term_preview",
         "bridge_preview",
-        "occupancy_debug",
-        "occupancy_period_summary",
-        "period_labels",
+        "occupancy_selected",
+        "occupancy_issues",
+        "occ_headers",
         "workbook_bytes",
         "workbook_name",
         "match_count",
         "term_count",
+        "fci_alerts",
+        "fci_matches",
+        "fci_ran",
     ]:
         st.session_state.pop(key, None)
 
@@ -529,6 +575,7 @@ def build_term_bridge_for_account(sf: Salesforce, account_name: str):
         "Stated_Maturity_Date__c",
         "Original_Line_Maturity_Date__c",
         "Aggregate_Funding__c",
+        "Servicer_Commitment_Id__c",
     ]
 
     where_account = (
@@ -551,7 +598,7 @@ def build_term_bridge_for_account(sf: Salesforce, account_name: str):
     df_all = pd.DataFrame(rows).drop(columns=["attributes"], errors="ignore")
     df_all = safe_flatten_recordtype(df_all)
     if df_all.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     df_all["InterestRate_Picked"] = df_all.get("Rate__c")
     blank_rate = df_all["InterestRate_Picked"].isna() | (
@@ -598,11 +645,7 @@ def build_term_bridge_for_account(sf: Salesforce, account_name: str):
 
     df_term = pd.DataFrame()
     if not df_term_raw.empty:
-        df_term["Loan ID"] = df_term_raw["Deal_Loan_Number__c"].apply(
-            lambda x: str(last5_strip_prefix(x)).zfill(5)
-            if str(last5_strip_prefix(x)).strip()
-            else ""
-        )
+        df_term["Loan ID"] = df_term_raw["Deal_Loan_Number__c"].apply(loan_id_5)
         df_term["Loan"] = df_term_raw.get("Name", "")
         df_term["Account Name"] = df_term_raw.get("Account_Name__c", "")
         df_term["Guarantor"] = df_term_raw.get("Guarantor", "").fillna("")
@@ -637,8 +680,15 @@ def build_term_bridge_for_account(sf: Salesforce, account_name: str):
         ).reset_index(drop=True)
 
     df_bridge = pd.DataFrame()
+    bridge_fci_rows = pd.DataFrame()
     if not df_bridge_opp.empty:
         deal_ids = df_bridge_opp["Id"].dropna().astype(str).unique().tolist()
+        prop_servicer_roll = query_property_servicer_ids_for_deals(sf, deal_ids)
+        prop_servicer_map = {}
+        if not prop_servicer_roll.empty:
+            prop_servicer_map = dict(
+                zip(prop_servicer_roll["Deal__c"], prop_servicer_roll["Property Servicer IDs"])
+            )
         advance_fields = ["Id", "Deal__c", "Advance_Num__c", "LOC_Commitment__c", "Wire_Date__c"]
         advance_rows: list[dict[str, Any]] = []
         for group in chunked(deal_ids, 200):
@@ -655,11 +705,13 @@ def build_term_bridge_for_account(sf: Salesforce, account_name: str):
         df_adv = pd.DataFrame(advance_rows).drop(columns=["attributes"], errors="ignore")
 
         if df_adv.empty:
-            df_bridge["Loan ID"] = df_bridge_opp["Deal_Loan_Number__c"].apply(
-                lambda x: str(last5_strip_prefix(x)).zfill(5)
-                if str(last5_strip_prefix(x)).strip()
-                else ""
+            df_bridge["Opportunity Id"] = df_bridge_opp["Id"]
+            df_bridge["Deal Loan Number Raw"] = df_bridge_opp["Deal_Loan_Number__c"]
+            df_bridge["Servicer Commitment ID"] = df_bridge_opp.get("Servicer_Commitment_Id__c", "")
+            df_bridge["Property Servicer IDs"] = (
+                df_bridge["Opportunity Id"].map(prop_servicer_map).fillna("")
             )
+            df_bridge["Loan ID"] = df_bridge_opp["Deal_Loan_Number__c"].apply(loan_id_5)
             df_bridge["Loan"] = df_bridge_opp.get("Name", "")
             df_bridge["Account Name"] = df_bridge_opp.get("Account_Name__c", "")
             df_bridge["Commitment Amount Num"] = None
@@ -682,8 +734,6 @@ def build_term_bridge_for_account(sf: Salesforce, account_name: str):
             df_bridge["Avg Hold Time Num"] = None
             df_bridge["Avg Disposed Time Num"] = None
         else:
-            from datetime import date
-
             df_adv["Advance_Num__c"] = pd.to_numeric(df_adv.get("Advance_Num__c"), errors="coerce")
             df_adv["LOC_Commitment__c"] = pd.to_numeric(
                 df_adv.get("LOC_Commitment__c"), errors="coerce"
@@ -830,11 +880,13 @@ def build_term_bridge_for_account(sf: Salesforce, account_name: str):
                 how="left",
             ).drop(columns=["Deal__c"], errors="ignore")
 
-            df_bridge["Loan ID"] = bridge_base["Deal_Loan_Number__c"].apply(
-                lambda x: str(last5_strip_prefix(x)).zfill(5)
-                if str(last5_strip_prefix(x)).strip()
-                else ""
+            df_bridge["Opportunity Id"] = bridge_base["Id"]
+            df_bridge["Deal Loan Number Raw"] = bridge_base["Deal_Loan_Number__c"]
+            df_bridge["Servicer Commitment ID"] = bridge_base.get("Servicer_Commitment_Id__c", "")
+            df_bridge["Property Servicer IDs"] = (
+                df_bridge["Opportunity Id"].map(prop_servicer_map).fillna("")
             )
+            df_bridge["Loan ID"] = bridge_base["Deal_Loan_Number__c"].apply(loan_id_5)
             df_bridge["Loan"] = bridge_base.get("Name", "")
             df_bridge["Account Name"] = bridge_base.get("Account_Name__c", "")
             df_bridge["Commitment Amount Num"] = pd.to_numeric(
@@ -882,175 +934,852 @@ def build_term_bridge_for_account(sf: Salesforce, account_name: str):
             ascending=[False, True],
             kind="stable",
         ).reset_index(drop=True)
+        bridge_fci_rows = df_bridge.copy()
+        df_bridge = df_bridge.drop(columns=FCI_INTERNAL_BRIDGE_COLUMNS, errors="ignore")
 
-    return df_term, df_bridge
+    return df_term, df_bridge, bridge_fci_rows
 
 
 # -------------------------
-# Occupancy helpers
+# FCI Bridge late-payment / late-charge helpers
 # -------------------------
-def quarter_label(period_end_date: pd.Timestamp) -> str:
-    quarter = ((period_end_date.month - 1) // 3) + 1
-    return f"{period_end_date.year} Q{quarter}"
+def load_fci_token() -> str | None:
+    try:
+        fci_section = dict(st.secrets.get("fci", {}))
+    except Exception:
+        fci_section = {}
+    token = fci_section.get("token")
+    if token:
+        return str(token).strip()
+    token = st.session_state.get("fci_token")
+    return str(token).strip() if token else None
 
 
 
-def build_occupancy_lookup(
-    berkadia_bytes: bytes,
-    periods_to_keep: int = 4,
-    min_coverage_ratio: float = 0.25,
-):
-    required_columns = [
-        "Investor Loan#",
-        "Consolidated?",
-        "Prop Seq#",
-        "Property Name",
-        "Freq of Analysis",
-        "Period End Date",
-        "Occupancy %",
+def split_candidate_ids(value):
+    if value is None:
+        return []
+    try:
+        if pd.isna(value):
+            return []
+    except Exception:
+        pass
+    parts = re.split(r"[,;|\n\r\t]+", str(value))
+    out = []
+    for part in parts:
+        s = part.strip()
+        if s and s.lower() not in {"nan", "none", "null", "n/a", "na", "-"}:
+            out.append(s)
+    return out
+
+
+
+def unique_join(values):
+    out = []
+    seen = set()
+    for v in values:
+        for s in split_candidate_ids(v):
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+    return ", ".join(out)
+
+
+
+def norm_match_key(x) -> str:
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    s = str(x).strip()
+    if not s or s.lower() in {"nan", "none", "null", "n/a", "na", "-"}:
+        return ""
+    return re.sub(r"[\s\-]+", "", s).upper()
+
+
+
+def to_float_or_none(x):
+    if x in ("", None):
+        return None
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        pass
+    try:
+        s = str(x).replace("$", "").replace(",", "").strip()
+        if s.lower() in {"n/a", "na", "none", "null", ""}:
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+
+
+def parse_fci_date(x):
+    if x in ("", None):
+        return None
+    s = str(x).strip()
+    if not s or s.lower() in {"n/a", "na", "none", "null", "0"}:
+        return None
+    dt = pd.to_datetime(s, errors="coerce")
+    if pd.isna(dt):
+        return None
+    return dt.date()
+
+
+
+def is_nonzero_money(x, tolerance: float = 0.01) -> bool:
+    v = to_float_or_none(x)
+    return v is not None and abs(v) > tolerance
+
+
+
+def fci_auth_headers(api_token: str) -> dict:
+    token_text = str(api_token or "").strip()
+    auth_value = token_text if token_text.lower().startswith("bearer ") else f"Bearer {token_text}"
+    return {
+        "Authorization": auth_value,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+
+def fci_build_get_loan_information_query(loan_account, fields):
+    fields_text = (chr(10) + "            ").join(fields)
+    loan_account_literal = json.dumps(str(loan_account))
+    return f"""
+{{
+  getLoanInformation
+    (
+        loanaccount:{loan_account_literal},
+        offset:0,
+        orderby: "LoanAccount",
+        order: "asc"
+    )
+        {{
+            {fields_text}
+        }}
+}}
+"""
+
+
+
+def fci_post_graphql(query: str, api_token=None):
+    if not api_token:
+        raise RuntimeError("Missing FCI token.")
+
+    resp = requests.post(
+        FCI_URL,
+        headers=fci_auth_headers(api_token),
+        json={"query": query, "variables": {}},
+        timeout=FCI_TIMEOUT_SECONDS,
+    )
+
+    preview = (resp.text or "")[:500]
+    try:
+        body = resp.json()
+    except Exception:
+        raise RuntimeError(f"FCI API returned non-JSON response. HTTP {resp.status_code}. Preview: {preview}")
+
+    if resp.status_code >= 400:
+        raise RuntimeError(f"FCI API HTTP {resp.status_code}. Preview: {preview}")
+
+    return body
+
+
+
+def fci_get_loan_information_by_loanaccount(loan_account, api_token=None):
+    """Query FCI by documented loanaccount argument. Deal Loan Number is not used."""
+    fields = list(FCI_LOAN_FIELDS)
+    last_error = None
+
+    for _ in range(8):
+        query = fci_build_get_loan_information_query(loan_account, fields)
+        body = fci_post_graphql(query, api_token=api_token)
+        errors = body.get("errors") or []
+
+        if not errors:
+            rows = (body.get("data") or {}).get("getLoanInformation") or []
+            if isinstance(rows, dict):
+                rows = [rows]
+            return rows
+
+        msg = " | ".join(str(e.get("message", e)) for e in errors)
+        last_error = msg
+
+        bad_fields = set(re.findall(r'Cannot query field "([^"]+)"', msg))
+        if bad_fields:
+            new_fields = [f for f in fields if f not in bad_fields]
+            if len(new_fields) != len(fields):
+                fields = new_fields
+                continue
+
+        raise RuntimeError(f"FCI GraphQL error for loanAccount {loan_account}: {msg}")
+
+    raise RuntimeError(f"FCI GraphQL error for loanAccount {loan_account}: {last_error}")
+
+
+
+def query_property_servicer_ids_for_deals(sf: Salesforce, deal_ids):
+    """FCI-only lookup. Does not change the original Bridge rollup logic."""
+    if not deal_ids:
+        return pd.DataFrame(columns=["Deal__c", "Property Servicer IDs"])
+
+    fields = ["Id", "Deal__c", "Servicer_Id__c"]
+    rows_all = []
+    for group in chunked(deal_ids, 200):
+        where_prop = f"Deal__c IN ({', '.join(soql_quote(item) for item in group)})"
+        rows, _, _ = try_query_drop_missing(
+            sf, "Property__c", fields, where_prop, limit=2000, order_by="CreatedDate DESC"
+        )
+        rows_all.extend(rows)
+
+    df = pd.DataFrame(rows_all).drop(columns=["attributes"], errors="ignore")
+    if df.empty or "Deal__c" not in df.columns or "Servicer_Id__c" not in df.columns:
+        return pd.DataFrame(columns=["Deal__c", "Property Servicer IDs"])
+
+    df["Servicer_Id__c"] = df["Servicer_Id__c"].fillna("").astype(str).str.strip()
+    df = df[df["Servicer_Id__c"] != ""].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["Deal__c", "Property Servicer IDs"])
+
+    return (
+        df.groupby("Deal__c", dropna=False)["Servicer_Id__c"]
+        .apply(lambda s: unique_join(s.tolist()))
+        .reset_index()
+        .rename(columns={"Servicer_Id__c": "Property Servicer IDs"})
+    )
+
+
+
+def bridge_row_fci_candidates(row):
+    candidates = []
+    for col_name in ["Servicer Commitment ID", "Property Servicer IDs"]:
+        if col_name in row.index:
+            candidates.extend(split_candidate_ids(row.get(col_name)))
+
+    out = []
+    seen = set()
+    for candidate in candidates:
+        key = norm_match_key(candidate)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(candidate)
+    return out
+
+
+
+def fci_add_alert(alerts, base, severity, issue, field="", fci_value=None, salesforce_value=None, days_past_due=None):
+    alerts.append({
+        "Severity": severity,
+        "Loan": base.get("Loan"),
+        "Loan ID": base.get("Loan ID"),
+        "Opportunity Id": base.get("Opportunity Id"),
+        "Deal Loan Number Raw": base.get("Deal Loan Number Raw"),
+        "Servicer Commitment ID": base.get("Servicer Commitment ID"),
+        "Property Servicer IDs": base.get("Property Servicer IDs"),
+        "Attempted FCI LoanAccount IDs": base.get("Attempted FCI LoanAccount IDs"),
+        "FCI Loan Account": base.get("FCI Loan Account"),
+        "FCI Match Key": base.get("FCI Match Key"),
+        "Issue": issue,
+        "Field": field,
+        "FCI Value": fci_value,
+        "Salesforce Value": salesforce_value,
+        "Days Past Due": days_past_due,
+        "FCI Status": base.get("FCI Status"),
+        "FCI Status Lender": base.get("FCI Status Lender"),
+        "FCI Principal Balance": base.get("FCI Principal Balance"),
+        "FCI Next Due Date": base.get("FCI Next Due Date"),
+        "FCI Paid To Date": base.get("FCI Paid To Date"),
+    })
+
+
+
+def evaluate_fci_record_for_alerts(match_row: dict):
+    """Checks only: (1) late payments, (2) late charge balances."""
+    rec = match_row.get("FCI Record") or {}
+    alerts = []
+
+    fci_principal = to_float_or_none(rec.get("principalBalance"))
+    fci_next_due = parse_fci_date(rec.get("nextDueDate"))
+    fci_paid_to = parse_fci_date(rec.get("paidToDate"))
+    today = date.today()
+
+    status = str(rec.get("status") or "").strip()
+    status_lender = str(rec.get("statusLender") or "").strip()
+    status_text = f"{status} {status_lender}".strip().lower()
+
+    base = dict(match_row)
+    base.update({
+        "FCI Status": status,
+        "FCI Status Lender": status_lender,
+        "FCI Principal Balance": fci_principal,
+        "FCI Next Due Date": fci_next_due,
+        "FCI Paid To Date": fci_paid_to,
+    })
+
+    if fci_principal is not None and fci_principal > 0:
+        if fci_next_due is not None and fci_next_due < today:
+            days = (today - fci_next_due).days
+            severity = "Critical" if days >= 30 else "Warning"
+            fci_add_alert(
+                alerts,
+                base,
+                severity,
+                f"Late payment: FCI next due date is {days} day(s) past due.",
+                "nextDueDate",
+                fci_next_due,
+                days_past_due=days,
+            )
+
+    late_status_tokens = [
+        "delinquent",
+        "late",
+        "past due",
+        "default",
+        "non-performing",
+        "non performing",
     ]
+    for token_text in late_status_tokens:
+        if token_text in status_text:
+            fci_add_alert(
+                alerts,
+                base,
+                "Warning",
+                f"Late-payment status indicator: FCI status contains '{token_text}'.",
+                "status/statusLender",
+                f"{status} / {status_lender}",
+            )
+            break
+
+    late_charge_fields = [
+        ("unpaidLateCharges", "Unpaid late charges are non-zero."),
+        ("deferredLateCharges", "Deferred late charges are non-zero."),
+        ("poffAcurredLateCharges", "Payoff accrued late charges are non-zero."),
+        ("poffUnpaidLateCharges", "Payoff unpaid late charges are non-zero."),
+        ("poffPaidLateCharges", "Payoff paid late charges are non-zero."),
+    ]
+    for field_name, issue in late_charge_fields:
+        val = rec.get(field_name)
+        if is_nonzero_money(val):
+            fci_add_alert(alerts, base, "Warning", issue, field_name, val)
+
+    return alerts
+
+
+
+def check_bridge_loans_against_fci(bridge_fci_rows: pd.DataFrame, api_token=None):
+    """Return (matches_df, alerts_df). Matching is only by FCI loanAccount using
+    Salesforce Servicer Commitment ID and Property Servicer ID."""
+    if bridge_fci_rows is None or bridge_fci_rows.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    if not api_token:
+        return pd.DataFrame(), pd.DataFrame()
+
+    rows = bridge_fci_rows.reset_index(drop=True).copy()
+    rows["_fci_candidates"] = rows.apply(bridge_row_fci_candidates, axis=1)
+    rows["Attempted FCI LoanAccount IDs"] = rows["_fci_candidates"].apply(lambda vals: ", ".join(vals))
+
+    all_candidates = []
+    seen = set()
+    for vals in rows["_fci_candidates"].tolist():
+        for candidate in vals:
+            key = norm_match_key(candidate)
+            if key and key not in seen:
+                seen.add(key)
+                all_candidates.append(candidate)
+
+    candidate_records = {}
+    lookup_errors = []
+    for candidate in all_candidates:
+        try:
+            candidate_records[norm_match_key(candidate)] = fci_get_loan_information_by_loanaccount(
+                candidate, api_token=api_token
+            )
+        except Exception as exc:
+            candidate_records[norm_match_key(candidate)] = []
+            lookup_errors.append(f"{candidate}: {exc}")
+
+    matched_rows = []
+    alerts = []
+
+    for _, row in rows.iterrows():
+        candidates = row.get("_fci_candidates", []) or []
+        matches = []
+        for candidate in candidates:
+            key = norm_match_key(candidate)
+            for rec in candidate_records.get(key, []) or []:
+                matches.append((candidate, rec))
+
+        deduped = []
+        seen_match = set()
+        for candidate, rec in matches:
+            rec_key = norm_match_key(rec.get("loanAccount")) or f"{candidate}-{id(rec)}"
+            if rec_key in seen_match:
+                continue
+            seen_match.add(rec_key)
+            deduped.append((candidate, rec))
+
+        if not deduped:
+            continue
+
+        for candidate, rec in deduped:
+            match_row = {
+                "Loan": row.get("Loan"),
+                "Loan ID": row.get("Loan ID"),
+                "Opportunity Id": row.get("Opportunity Id"),
+                "Deal Loan Number Raw": row.get("Deal Loan Number Raw"),
+                "Servicer Commitment ID": row.get("Servicer Commitment ID"),
+                "Property Servicer IDs": row.get("Property Servicer IDs"),
+                "Attempted FCI LoanAccount IDs": row.get("Attempted FCI LoanAccount IDs"),
+                "Outstanding Balance Num": row.get("Outstanding Balance Num"),
+                "FCI Loan Account": rec.get("loanAccount"),
+                "FCI Match Key": candidate,
+                "FCI Record": rec,
+            }
+            matched_rows.append(match_row)
+            alerts.extend(evaluate_fci_record_for_alerts(match_row))
+
+    matches_preview = []
+    for m in matched_rows:
+        rec = m.get("FCI Record") or {}
+        matches_preview.append({
+            "Loan": m.get("Loan"),
+            "Loan ID": m.get("Loan ID"),
+            "Opportunity Id": m.get("Opportunity Id"),
+            "Deal Loan Number Raw": m.get("Deal Loan Number Raw"),
+            "Servicer Commitment ID": m.get("Servicer Commitment ID"),
+            "Property Servicer IDs": m.get("Property Servicer IDs"),
+            "Attempted FCI LoanAccount IDs": m.get("Attempted FCI LoanAccount IDs"),
+            "FCI Loan Account": rec.get("loanAccount"),
+            "FCI Match Key": m.get("FCI Match Key"),
+            "FCI Status": rec.get("status"),
+            "FCI Status Lender": rec.get("statusLender"),
+            "FCI Principal Balance": to_float_or_none(rec.get("principalBalance")),
+            "FCI Next Due Date": parse_fci_date(rec.get("nextDueDate")),
+            "FCI Paid To Date": parse_fci_date(rec.get("paidToDate")),
+            "FCI Paid Off Date": parse_fci_date(rec.get("paidOffDate")),
+            "FCI Late Charge Days": to_float_or_none(rec.get("lateChargesDays")),
+            "FCI Late Charge Pct": to_float_or_none(rec.get("lateChargesPct")),
+            "FCI Unpaid Late Charges": to_float_or_none(rec.get("unpaidLateCharges")),
+            "FCI Deferred Late Charges": to_float_or_none(rec.get("deferredLateCharges")),
+            "FCI Payoff Accrued Late Charges": to_float_or_none(rec.get("poffAcurredLateCharges")),
+            "FCI Payoff Unpaid Late Charges": to_float_or_none(rec.get("poffUnpaidLateCharges")),
+            "FCI Payoff Paid Late Charges": to_float_or_none(rec.get("poffPaidLateCharges")),
+        })
+
+    matches_df = pd.DataFrame(matches_preview)
+    alerts_df = pd.DataFrame(alerts)
+
+    severity_order = {"Critical": 0, "Warning": 1, "Info": 2}
+    if not alerts_df.empty:
+        alerts_df["_severity_sort"] = alerts_df["Severity"].map(severity_order).fillna(9)
+        alerts_df = (
+            alerts_df.sort_values(["_severity_sort", "Loan", "FCI Loan Account", "Issue"], kind="stable")
+            .drop(columns=["_severity_sort"], errors="ignore")
+            .reset_index(drop=True)
+        )
+
+    if lookup_errors:
+        st.session_state["fci_lookup_errors"] = lookup_errors
+    else:
+        st.session_state.pop("fci_lookup_errors", None)
+
+    return matches_df, alerts_df
+
+
+
+def write_fci_alerts_sheet(wb, alerts_df: pd.DataFrame, matches_df: pd.DataFrame | None = None):
+    if FCI_ALERT_SHEET in wb.sheetnames:
+        del wb[FCI_ALERT_SHEET]
+
+    ws = wb.create_sheet(FCI_ALERT_SHEET)
+    ws.sheet_view.showGridLines = False
+
+    title_fill = PatternFill("solid", fgColor="1F4E78")
+    header_fill = PatternFill("solid", fgColor="D9EAF7")
+    critical_fill = PatternFill("solid", fgColor="F4CCCC")
+    warning_fill = PatternFill("solid", fgColor="FFF2CC")
+    info_fill = PatternFill("solid", fgColor="D9EAD3")
+
+    ws["A1"] = "FCI Bridge Late Payment / Late Charge Alerts"
+    ws["A1"].font = Font(bold=True, color="FFFFFF", size=14)
+    ws["A1"].fill = title_fill
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8)
+
+    ws["A2"] = f"Run Date: {datetime.now().strftime('%m/%d/%Y %I:%M %p')}"
+    ws["A2"].font = Font(italic=True)
+
+    if alerts_df is None or alerts_df.empty:
+        ws["A4"] = "No late payment or late charge items found for the matched FCI loans."
+        ws["A4"].font = Font(bold=True)
+        start_match_row = 7
+    else:
+        cols = [
+            "Severity",
+            "Loan",
+            "Loan ID",
+            "Deal Loan Number Raw",
+            "Servicer Commitment ID",
+            "Property Servicer IDs",
+            "Attempted FCI LoanAccount IDs",
+            "FCI Loan Account",
+            "FCI Match Key",
+            "Issue",
+            "Field",
+            "FCI Value",
+            "Salesforce Value",
+            "Days Past Due",
+            "FCI Status",
+            "FCI Status Lender",
+            "FCI Principal Balance",
+            "FCI Next Due Date",
+            "FCI Paid To Date",
+        ]
+        cols = [c for c in cols if c in alerts_df.columns]
+
+        start_row = 4
+        for c_idx, col_name in enumerate(cols, start=1):
+            cell = ws.cell(start_row, c_idx)
+            cell.value = col_name
+            cell.font = Font(bold=True)
+            cell.fill = header_fill
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+        for r_idx, (_, row) in enumerate(alerts_df[cols].iterrows(), start=start_row + 1):
+            sev = str(row.get("Severity", ""))
+            row_fill = critical_fill if sev == "Critical" else warning_fill if sev == "Warning" else info_fill if sev == "Info" else None
+            for c_idx, col_name in enumerate(cols, start=1):
+                cell = ws.cell(r_idx, c_idx)
+                val = row.get(col_name)
+                if isinstance(val, (date, datetime)):
+                    cell.value = val
+                    cell.number_format = "m/d/yyyy"
+                else:
+                    cell.value = excel_safe(val)
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+                if row_fill and col_name == "Severity":
+                    cell.fill = row_fill
+
+        start_match_row = start_row + len(alerts_df) + 4
+
+    if matches_df is not None and not matches_df.empty:
+        ws.cell(start_match_row, 1).value = "FCI Matched Records"
+        ws.cell(start_match_row, 1).font = Font(bold=True, size=12)
+
+        match_cols = [
+            "Loan",
+            "Loan ID",
+            "Deal Loan Number Raw",
+            "Servicer Commitment ID",
+            "Property Servicer IDs",
+            "Attempted FCI LoanAccount IDs",
+            "FCI Loan Account",
+            "FCI Match Key",
+            "FCI Status",
+            "FCI Status Lender",
+            "FCI Principal Balance",
+            "FCI Next Due Date",
+            "FCI Paid To Date",
+            "FCI Paid Off Date",
+            "FCI Late Charge Days",
+            "FCI Late Charge Pct",
+            "FCI Unpaid Late Charges",
+            "FCI Deferred Late Charges",
+            "FCI Payoff Accrued Late Charges",
+            "FCI Payoff Unpaid Late Charges",
+            "FCI Payoff Paid Late Charges",
+        ]
+        match_cols = [c for c in match_cols if c in matches_df.columns]
+
+        header_row = start_match_row + 1
+        for c_idx, col_name in enumerate(match_cols, start=1):
+            cell = ws.cell(header_row, c_idx)
+            cell.value = col_name
+            cell.font = Font(bold=True)
+            cell.fill = header_fill
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+        for r_idx, (_, row) in enumerate(matches_df[match_cols].iterrows(), start=header_row + 1):
+            for c_idx, col_name in enumerate(match_cols, start=1):
+                cell = ws.cell(r_idx, c_idx)
+                val = row.get(col_name)
+                if isinstance(val, (date, datetime)):
+                    cell.value = val
+                    cell.number_format = "m/d/yyyy"
+                else:
+                    cell.value = excel_safe(val)
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    width_by_col = {
+        "A": 14, "B": 28, "C": 12, "D": 18, "E": 22, "F": 30, "G": 50,
+        "H": 18, "I": 18, "J": 60, "K": 22, "L": 24, "M": 30, "N": 16,
+        "O": 18, "P": 20, "Q": 18, "R": 18, "S": 18, "T": 18, "U": 18,
+    }
+    for col_letter, width in width_by_col.items():
+        ws.column_dimensions[col_letter].width = width
+
+    ws.freeze_panes = "A5"
+
+
+# -------------------------
+# Occupancy helpers (template-driven, matches the notebook)
+# -------------------------
+_OCC_RX_1 = re.compile(r"^\s*(?P<year>\d{4})\s*[Qq]\s*(?P<quarter>[1-4])\s*Occ\s*%?\s*$")
+_OCC_RX_2 = re.compile(r"^\s*[Qq]\s*(?P<quarter>[1-4])\s*(?P<year>\d{4})\s*Occ\s*%?\s*$")
+
+
+def parse_occ_header(value: Any):
+    if value is None or str(value).strip() == "":
+        return None
+    txt = re.sub(r"\s+", " ", str(value).strip())
+    for rx in (_OCC_RX_1, _OCC_RX_2):
+        m = rx.match(txt)
+        if m:
+            year = int(m.group("year"))
+            quarter = int(m.group("quarter"))
+            return {
+                "header": txt,
+                "quarter_key": f"{year} Q{quarter}",
+                "year": year,
+                "quarter": quarter,
+            }
+    return None
+
+
+
+def get_term_occupancy_headers(ws):
+    header_row, _ = find_header_row_and_map(ws, must_have=("portfolio", "loan id"))
+    items = []
+    for c in range(1, ws.max_column + 1):
+        parsed = parse_occ_header(ws.cell(header_row, c).value)
+        if parsed:
+            parsed["col"] = c
+            items.append(parsed)
+    return items
+
+
+
+def read_template_term_occ_headers(template_bytes: bytes):
+    workbook = load_workbook(io.BytesIO(template_bytes), read_only=True, data_only=False)
+    try:
+        if TERM_SHEET in workbook.sheetnames:
+            return get_term_occupancy_headers(workbook[TERM_SHEET])
+        return []
+    finally:
+        workbook.close()
+
+
+
+def find_sheet_name_case_insensitive(sheet_names, target_name: str):
+    target_norm = norm_hdr(target_name)
+    for s in sheet_names:
+        if norm_hdr(s) == target_norm:
+            return s
+    for s in sheet_names:
+        if target_norm in norm_hdr(s):
+            return s
+    return None
+
+
+
+def detect_header_row_in_uploaded_sheet(ws, required_headers, scan_rows: int = 20, scan_cols: int = 80):
+    required = {norm_hdr(x) for x in required_headers}
+    for r in range(1, min(ws.max_row, scan_rows) + 1):
+        row_vals = [norm_hdr(ws.cell(r, c).value) for c in range(1, min(ws.max_column, scan_cols) + 1)]
+        if required.issubset(set(row_vals)):
+            return r
+    raise ValueError(
+        f"Could not find a header row on '{ws.title}' containing {sorted(required_headers)} in the first {scan_rows} rows."
+    )
+
+
+
+def load_financial_analysis_df_from_bytes(berkadia_bytes: bytes) -> pd.DataFrame:
+    xls = pd.ExcelFile(io.BytesIO(berkadia_bytes), engine="openpyxl")
+    sheet_name = find_sheet_name_case_insensitive(xls.sheet_names, "Financial Analysis")
+    if not sheet_name:
+        raise ValueError(
+            f"Could not find a sheet named 'Financial Analysis' (case-insensitive). Sheets found: {xls.sheet_names}"
+        )
+
+    workbook = load_workbook(io.BytesIO(berkadia_bytes), read_only=True, data_only=True)
+    try:
+        ws = workbook[sheet_name]
+        header_row = detect_header_row_in_uploaded_sheet(
+            ws,
+            required_headers=["Investor Loan#", "Freq of Analysis", "Period End Date", "Occupancy %"],
+        )
+    finally:
+        workbook.close()
+
     df = pd.read_excel(
         io.BytesIO(berkadia_bytes),
-        sheet_name="Financial Analysis",
-        header=3,
-        usecols=lambda c: c in required_columns,
+        sheet_name=sheet_name,
+        header=header_row - 1,
+        engine="openpyxl",
+    )
+    df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed:")].copy()
+    return df
+
+
+
+def build_term_occupancy_lookup(berkadia_bytes: bytes, target_quarter_keys=None):
+    fa = load_financial_analysis_df_from_bytes(berkadia_bytes)
+
+    required_cols = ["Investor Loan#", "Freq of Analysis", "Period End Date", "Occupancy %"]
+    missing_cols = [c for c in required_cols if c not in fa.columns]
+    if missing_cols:
+        raise ValueError(f"Financial Analysis sheet is missing required columns: {missing_cols}")
+
+    fa = fa.copy()
+    fa["Loan ID 5"] = fa["Investor Loan#"].apply(loan_id_5)
+    fa = fa[fa["Loan ID 5"] != ""].copy()
+
+    fa["Period End Date_dt"] = pd.to_datetime(fa["Period End Date"], errors="coerce")
+    fa = fa[fa["Period End Date_dt"].notna()].copy()
+
+    fa["Quarter Key"] = (
+        fa["Period End Date_dt"].dt.year.astype(int).astype(str)
+        + " Q"
+        + fa["Period End Date_dt"].dt.quarter.astype(int).astype(str)
     )
 
-    missing_columns = [column for column in required_columns if column not in df.columns]
-    if missing_columns:
-        raise ValueError(
-            "The Financial Analysis sheet is missing required columns: " + ", ".join(missing_columns)
+    if target_quarter_keys:
+        target_quarter_keys = list(dict.fromkeys(target_quarter_keys))
+        fa = fa[fa["Quarter Key"].isin(target_quarter_keys)].copy()
+
+    fa["Occupancy Dec"] = fa["Occupancy %"].apply(pct_to_dec)
+    fa["Occupancy Date_dt"] = pd.to_datetime(fa.get("Occupancy Date"), errors="coerce")
+    fa["Freq Norm"] = fa["Freq of Analysis"].fillna("").astype(str).str.strip().str.upper()
+    if "Consolidated?" in fa.columns:
+        fa["Consolidated Norm"] = fa["Consolidated?"].fillna("").astype(str).str.strip().str.upper()
+    else:
+        fa["Consolidated Norm"] = ""
+    fa["Months Num"] = pd.to_numeric(fa.get("# of Months"), errors="coerce")
+    fa["Expected Freq"] = fa["Period End Date_dt"].dt.quarter.map(EXPECTED_FREQ_BY_QTR)
+    fa["Expected Months"] = fa["Period End Date_dt"].dt.quarter.map(EXPECTED_MONTHS_BY_QTR)
+    fa["Is Canonical Freq"] = fa["Freq Norm"].isin(CANONICAL_FREQS).astype(int)
+    fa["Freq Match"] = (fa["Freq Norm"] == fa["Expected Freq"]).astype(int)
+    fa["Months Match"] = (fa["Months Num"] == fa["Expected Months"]).astype(int)
+    fa["Has Occupancy"] = fa["Occupancy Dec"].notna().astype(int)
+
+    if "Prop Seq#" in fa.columns:
+        fa["Prop Seq Key"] = fa["Prop Seq#"].astype(str)
+    else:
+        fa["Prop Seq Key"] = ""
+
+    selected_rows = []
+    issue_rows = []
+
+    grp_cols = ["Loan ID 5", "Quarter Key"]
+    for (loan5, quarter_key), grp_all in fa.groupby(grp_cols, dropna=False):
+        grp = grp_all[grp_all["Has Occupancy"] == 1].copy()
+        if grp.empty:
+            continue
+
+        grp_y = grp[grp["Consolidated Norm"] == "Y"].copy()
+        if not grp_y.empty:
+            pool = grp_y.copy()
+            selection_source = "Consolidated"
+        else:
+            prop_count = (
+                grp["Prop Seq Key"]
+                .replace({"nan": pd.NA, "None": pd.NA, "": pd.NA})
+                .nunique(dropna=True)
+            )
+            if prop_count > 1:
+                issue_rows.append({
+                    "Loan ID 5": loan5,
+                    "Quarter Key": quarter_key,
+                    "Issue": "Skipped multi-property non-consolidated group (no safe way to aggregate occupancy).",
+                })
+                continue
+            pool = grp.copy()
+            selection_source = "Single-property non-consolidated"
+
+        pool = pool.sort_values(
+            by=[
+                "Freq Match",
+                "Months Match",
+                "Is Canonical Freq",
+                "Occupancy Date_dt",
+                "Period End Date_dt",
+            ],
+            ascending=[False, False, False, False, False],
+            na_position="last",
+            kind="stable",
         )
 
-    df["Loan ID"] = df["Investor Loan#"].apply(
-        lambda x: str(last5_strip_prefix(x)).zfill(5) if str(last5_strip_prefix(x)).strip() else None
-    )
-    df["Period End Date"] = pd.to_datetime(df["Period End Date"], errors="coerce")
-    df["Occupancy Dec"] = df["Occupancy %"].apply(pct_to_dec)
-    df["Prop Seq#"] = pd.to_numeric(df["Prop Seq#"], errors="coerce")
-    df["Is Consolidated"] = (
-        df["Consolidated?"].fillna("").astype(str).str.strip().str.upper().eq("Y")
-    )
-    df = df.dropna(subset=["Loan ID", "Period End Date"]).copy()
-    if df.empty:
-        raise ValueError("No usable occupancy rows were found in the Financial Analysis sheet.")
+        chosen = pool.iloc[0].copy()
+        chosen["Selection Source"] = selection_source
+        selected_rows.append(chosen)
 
-    def choose_row(group: pd.DataFrame) -> pd.Series:
-        consolidated_rows = group[group["Is Consolidated"]]
-        if not consolidated_rows.empty:
-            row = consolidated_rows.sort_values(["Prop Seq#", "Property Name"], na_position="last").iloc[0].copy()
-            row["Occupancy Source"] = "Consolidated row"
-            return row
+        distinct_occ = pool["Occupancy Dec"].dropna().round(6).nunique()
+        if distinct_occ > 1:
+            issue_rows.append({
+                "Loan ID 5": loan5,
+                "Quarter Key": quarter_key,
+                "Issue": "Multiple occupancy values found; best-ranked row selected.",
+                "Selected Freq": chosen.get("Freq Norm"),
+                "Selected Months": chosen.get("Months Num"),
+                "Selected Occupancy": chosen.get("Occupancy Dec"),
+            })
 
-        non_null_occ = group[group["Occupancy Dec"].notna()].copy()
-        if non_null_occ.empty:
-            row = group.sort_values(["Prop Seq#", "Property Name"], na_position="last").iloc[0].copy()
-            row["Occupancy Source"] = "No occupancy value"
-            return row
+    selected_df = pd.DataFrame(selected_rows)
+    issues_df = pd.DataFrame(issue_rows)
 
-        if len(non_null_occ) == 1:
-            row = non_null_occ.iloc[0].copy()
-            row["Occupancy Source"] = "Single property row"
-            return row
+    if selected_df.empty:
+        return {}, selected_df, issues_df, len(fa)
 
-        row = non_null_occ.sort_values(["Prop Seq#", "Property Name"], na_position="last").iloc[0].copy()
-        row["Occupancy Dec"] = non_null_occ["Occupancy Dec"].mean()
-        row["Occupancy Source"] = "Average of property rows"
-        return row
-
-    reduced_rows = []
-    for _, group in df.groupby(["Loan ID", "Period End Date"], dropna=False):
-        reduced_rows.append(choose_row(group))
-    reduced = pd.DataFrame(reduced_rows)
-
-    reduced["Period Label"] = reduced["Period End Date"].apply(quarter_label)
-    period_summary = (
-        reduced.groupby(["Period Label", "Period End Date"], dropna=False)
-        .agg(
-            Loan_Count=("Loan ID", "nunique"),
-            Occupancy_Count=("Occupancy Dec", lambda s: int(s.notna().sum())),
-            Frequency_Types=(
-                "Freq of Analysis",
-                lambda s: ", ".join(sorted({str(v) for v in s if pd.notna(v) and str(v).strip() != ""})),
-            ),
-        )
-        .reset_index()
-        .sort_values(["Period End Date", "Period Label"], ascending=[False, False])
-        .reset_index(drop=True)
-    )
-
-    max_coverage = int(period_summary["Occupancy_Count"].max()) if not period_summary.empty else 0
-    minimum_coverage = max(1, int(round(max_coverage * min_coverage_ratio)))
-
-    selected_summary = period_summary[period_summary["Occupancy_Count"] >= minimum_coverage].copy()
-    if len(selected_summary) < periods_to_keep:
-        selected_summary = period_summary.copy()
-    selected_summary = selected_summary.head(periods_to_keep).copy()
-
-    period_labels = selected_summary["Period Label"].tolist()
-    recent_periods = [pd.Timestamp(period) for period in selected_summary["Period End Date"].tolist()]
-
-    reduced = reduced[reduced["Period End Date"].isin(recent_periods)].copy()
-    pivot = (
-        reduced.pivot_table(
-            index="Loan ID",
-            columns="Period Label",
-            values="Occupancy Dec",
-            aggfunc="first",
-        )
-        .reindex(columns=period_labels)
-        .reset_index()
-    )
-
-    debug_columns = [
-        "Loan ID",
-        "Period End Date",
-        "Period Label",
-        "Occupancy %",
-        "Occupancy Dec",
-        "Occupancy Source",
-        "Consolidated?",
-        "Prop Seq#",
-        "Property Name",
-        "Freq of Analysis",
-    ]
-    debug_df = reduced[debug_columns].sort_values(
-        ["Loan ID", "Period End Date"],
-        ascending=[True, False],
-    )
-
-    period_summary["Selected"] = period_summary["Period Label"].isin(period_labels)
-    period_summary["Coverage Threshold"] = minimum_coverage
-    return pivot, period_labels, debug_df, period_summary
+    lookup = {
+        (row["Loan ID 5"], row["Quarter Key"]): row["Occupancy Dec"]
+        for _, row in selected_df.iterrows()
+    }
+    return lookup, selected_df, issues_df, len(fa)
 
 
 @st.cache_data(show_spinner=False)
-def load_occupancy_lookup_cached(berkadia_bytes: bytes):
-    return build_occupancy_lookup(berkadia_bytes)
+def load_occupancy_lookup_cached(berkadia_bytes: bytes, target_quarter_keys: tuple[str, ...]):
+    return build_term_occupancy_lookup(berkadia_bytes, list(target_quarter_keys))
 
 
 
-def add_occupancy_to_term_rows(
+def apply_term_occupancy_to_rows(
     term_rows: pd.DataFrame,
-    occupancy_pivot: pd.DataFrame,
-    period_labels: list[str],
+    occ_lookup: dict,
+    occ_headers,
 ) -> pd.DataFrame:
-    if term_rows.empty:
-        return term_rows.copy()
+    out = term_rows.copy()
+    if out.empty or not occ_headers:
+        return out
 
-    result = term_rows.copy()
-    lookup = occupancy_pivot.copy()
-    for label in period_labels:
-        if label not in lookup.columns:
-            lookup[label] = None
+    out["_Loan ID 5"] = out["Loan ID"].apply(loan_id_5)
+    for item in occ_headers:
+        header = item["header"]
+        quarter_key = item["quarter_key"]
+        out[header] = out["_Loan ID 5"].apply(
+            lambda k: occ_lookup.get((k, quarter_key), "-") if k else "-"
+        )
 
-    lookup = lookup.set_index("Loan ID")
-    for label in period_labels:
-        result[f"{label} Occ%"] = result["Loan ID"].map(lookup[label])
+    occ_cols = [item["header"] for item in occ_headers]
+    out["Occupancy Matched"] = out[occ_cols].apply(
+        lambda row: any(v not in ("-", None) and not (isinstance(v, float) and pd.isna(v)) for v in row),
+        axis=1,
+    )
+    out = out.drop(columns=["_Loan ID 5"], errors="ignore")
+    return out
 
-    occ_cols = [f"{label} Occ%" for label in period_labels]
-    result["Occupancy Matched"] = result[occ_cols].notna().any(axis=1)
-    return result
+
+
+def add_default_term_occupancy_columns(term_rows: pd.DataFrame, occ_headers) -> pd.DataFrame:
+    return apply_term_occupancy_to_rows(term_rows, {}, occ_headers)
 
 
 # -------------------------
@@ -1191,6 +1920,46 @@ def set_cell(ws, row_num: int, col_num: int, value: Any, number_format: str | No
 
 
 
+def round_percent_decimal(value: Any):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return round(float(value) * 100) / 100.0
+
+
+
+def set_occupancy_cell(ws, row_num: int, col_num: int, value: Any) -> None:
+    if value is None:
+        set_cell(ws, row_num, col_num, "-")
+        return
+
+    if isinstance(value, str):
+        text = value.strip()
+        if text == "" or text == "-":
+            set_cell(ws, row_num, col_num, "-")
+            return
+        parsed = pct_to_dec(text)
+        if parsed is None:
+            set_cell(ws, row_num, col_num, text)
+        else:
+            set_cell(ws, row_num, col_num, round_percent_decimal(parsed), "0%")
+        return
+
+    try:
+        if pd.isna(value):
+            set_cell(ws, row_num, col_num, "-")
+            return
+    except Exception:
+        pass
+
+    set_cell(ws, row_num, col_num, round_percent_decimal(value), "0%")
+
+
+
 def sum_ints(series) -> int:
     values = [value for value in series if value is not None and not pd.isna(value)]
     return int(sum(values)) if values else 0
@@ -1203,22 +1972,14 @@ def sum_money(series) -> float:
 
 
 
-def set_term_occupancy_headers(ws, header_row: int, col_map: dict[str, int], period_labels: list[str]) -> list[int]:
-    occ_cols = [col_num for header, col_num in col_map.items() if "occ" in header]
-    occ_cols = sorted(occ_cols)
-    for index, col_num in enumerate(occ_cols):
-        if index < len(period_labels):
-            ws.cell(header_row, col_num).value = f"{period_labels[index]} Occ%"
-    return occ_cols
-
-
-
-def write_term_sheet(ws, term_rows: pd.DataFrame, period_labels: list[str]):
+def write_term_sheet(ws, term_rows: pd.DataFrame, occ_headers=None):
     header_row, col_map = find_header_row_and_map(ws, must_have=("portfolio", "loan id"))
-    occ_cols = set_term_occupancy_headers(ws, header_row, col_map, period_labels)
-    last_col = max(max(col_map.values()), max(occ_cols) if occ_cols else 0)
+    last_col = max(col_map.values())
     total_row = find_total_row(ws, header_row)
     start_row, total_row = ensure_rows(ws, header_row, total_row, needed_rows=len(term_rows), last_col=last_col)
+
+    if occ_headers is None:
+        occ_headers = get_term_occupancy_headers(ws)
 
     def col(name: str):
         return col_map.get(norm_hdr(name))
@@ -1285,15 +2046,13 @@ def write_term_sheet(ws, term_rows: pd.DataFrame, period_labels: list[str]):
         if col("current loan maturity date"):
             set_cell(ws, row_num, col("current loan maturity date"), row.get("Maturity Date", None), "m/d/yyyy")
 
-        for occ_index, label in enumerate(period_labels):
-            if occ_index >= len(occ_cols):
-                break
-            value = row.get(f"{label} Occ%", None)
-            value = None if (value is None or pd.isna(value)) else float(value)
-            set_cell(ws, row_num, occ_cols[occ_index], value, "0.0%")
-
-        for extra_col in occ_cols[len(period_labels) :]:
-            set_cell(ws, row_num, extra_col, None)
+        if occ_headers:
+            for occ in occ_headers:
+                set_occupancy_cell(ws, row_num, occ["col"], row.get(occ["header"], "-"))
+        else:
+            for key in list(col_map.keys()):
+                if "occ" in key:
+                    set_cell(ws, row_num, col_map[key], "-")
 
     if col("loan"):
         set_cell(ws, total_row, col("loan"), int(len(term_rows)))
@@ -1432,13 +2191,21 @@ def build_workbook_bytes(
     term_rows: pd.DataFrame,
     bridge_rows: pd.DataFrame,
     account_name: str,
-    period_labels: list[str],
+    fci_alerts: pd.DataFrame | None = None,
+    fci_matches: pd.DataFrame | None = None,
+    include_fci: bool = False,
 ):
     workbook = load_workbook(io.BytesIO(template_bytes))
     if TERM_SHEET in workbook.sheetnames:
-        write_term_sheet(workbook[TERM_SHEET], term_rows, period_labels)
+        write_term_sheet(workbook[TERM_SHEET], term_rows, occ_headers=None)
     if BRIDGE_SHEET in workbook.sheetnames:
         write_bridge_sheet(workbook[BRIDGE_SHEET], bridge_rows)
+    if include_fci:
+        write_fci_alerts_sheet(
+            workbook,
+            fci_alerts if fci_alerts is not None else pd.DataFrame(),
+            fci_matches if fci_matches is not None else pd.DataFrame(),
+        )
 
     output = io.BytesIO()
     workbook.save(output)
@@ -1447,12 +2214,14 @@ def build_workbook_bytes(
 
 
 
-def format_preview(df: pd.DataFrame, period_labels: list[str]) -> pd.DataFrame:
+def format_preview(df: pd.DataFrame, occ_headers) -> pd.DataFrame:
     preview = df.copy()
-    for label in period_labels:
-        column = f"{label} Occ%"
+    occ_cols = [item["header"] for item in occ_headers] if occ_headers else []
+    for column in occ_cols:
         if column in preview.columns:
-            preview[column] = preview[column].apply(lambda x: "" if pd.isna(x) else f"{x:.1%}")
+            preview[column] = preview[column].apply(
+                lambda x: x if isinstance(x, str) else ("" if pd.isna(x) else f"{x:.1%}")
+            )
     if "Historical Ontime % Dec" in preview.columns:
         preview["Historical Ontime % Dec"] = preview["Historical Ontime % Dec"].apply(
             lambda x: "" if pd.isna(x) else f"{x:.0%}"
@@ -1535,8 +2304,24 @@ if sf is None:
 
 st.success("Salesforce login complete.")
 
+# Read the dated occupancy quarter columns the Term template expects.
+template_bytes = load_template_bytes()
+try:
+    occ_headers = read_template_term_occ_headers(template_bytes)
+except Exception as exc:
+    occ_headers = []
+    st.warning(f"Could not read occupancy headers from the template: {exc}")
+
+st.session_state["occ_headers"] = occ_headers
+target_quarters = tuple(item["quarter_key"] for item in occ_headers)
+
 st.subheader("Step 2: Upload the Berkadia servicer file")
 st.caption("The AM template workbook is loaded automatically from the repository. You do not need to upload it here.")
+if occ_headers:
+    st.caption("Template occupancy quarters: " + ", ".join(target_quarters))
+else:
+    st.caption("The Term template has no dated occupancy columns (e.g. '2024 Q1 Occ%'), so occupancy will be left blank.")
+
 berkadia_file = st.file_uploader(
     "Upload Berkadia servicer file",
     type=["xlsx", "xlsm"],
@@ -1548,25 +2333,52 @@ if berkadia_file is None:
     st.info("Upload the Berkadia servicer file to continue.")
     st.stop()
 
-occupancy_pivot = None
-period_labels = []
-occupancy_debug = None
-occupancy_period_summary = None
+occupancy_lookup = {}
+occupancy_selected = pd.DataFrame()
+occupancy_issues = pd.DataFrame()
+fa_row_count = 0
 try:
-    occupancy_pivot, period_labels, occupancy_debug, occupancy_period_summary = load_occupancy_lookup_cached(
-        berkadia_file.getvalue()
+    occupancy_lookup, occupancy_selected, occupancy_issues, fa_row_count = load_occupancy_lookup_cached(
+        berkadia_file.getvalue(),
+        target_quarters,
     )
-    selected_periods = ", ".join(period_labels) if period_labels else "none detected"
-    st.success(f"Berkadia file loaded. Using these occupancy periods: {selected_periods}")
+    st.success(
+        f"Berkadia file loaded. Financial Analysis rows read: {fa_row_count}. "
+        f"Selected occupancy rows: {len(occupancy_selected)}."
+    )
 except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-if isinstance(occupancy_period_summary, pd.DataFrame) and not occupancy_period_summary.empty:
-    with st.expander("Review detected occupancy periods", expanded=False):
-        summary_display = occupancy_period_summary.copy()
-        summary_display["Selected"] = summary_display["Selected"].map({True: "Yes", False: "No"})
-        st.dataframe(summary_display, use_container_width=True, hide_index=True)
+st.session_state["occupancy_selected"] = occupancy_selected
+st.session_state["occupancy_issues"] = occupancy_issues
+
+if isinstance(occupancy_selected, pd.DataFrame) and not occupancy_selected.empty:
+    with st.expander("Review selected occupancy rows", expanded=False):
+        review_cols = [
+            "Loan ID 5",
+            "Quarter Key",
+            "Occupancy Dec",
+            "Freq Norm",
+            "Months Num",
+            "Selection Source",
+            "Investor Loan#",
+        ]
+        review_cols = [c for c in review_cols if c in occupancy_selected.columns]
+        review = occupancy_selected[review_cols].copy()
+        if "Occupancy Dec" in review.columns:
+            review["Occupancy Dec"] = review["Occupancy Dec"].apply(
+                lambda x: "" if pd.isna(x) else f"{x:.1%}"
+            )
+        st.dataframe(
+            review.sort_values([c for c in ["Loan ID 5", "Quarter Key"] if c in review.columns]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+if isinstance(occupancy_issues, pd.DataFrame) and not occupancy_issues.empty:
+    with st.expander("Occupancy selection notes", expanded=False):
+        st.dataframe(occupancy_issues, use_container_width=True, hide_index=True)
 
 st.subheader("Step 3: Search Salesforce and choose an account")
 search_col1, search_col2 = st.columns([1, 2])
@@ -1604,43 +2416,78 @@ else:
     st.info("Search Salesforce to load the account list.")
 
 st.subheader("Step 4: Build and download the AM slide")
+
+fci_token = load_fci_token()
+run_fci = st.checkbox(
+    "Also check Bridge loans against FCI (late payments / late charges)",
+    value=False,
+    help="Matches Bridge loans to FCI by Servicer Commitment ID and Property Servicer ID, then flags late payments and late-charge balances on a separate sheet.",
+)
+if run_fci and not fci_token:
+    fci_token_input = st.text_input(
+        "FCI API token",
+        type="password",
+        help="Used only for this session. You can instead set it under [fci] token in Streamlit secrets.",
+    )
+    if fci_token_input:
+        st.session_state["fci_token"] = fci_token_input.strip()
+        fci_token = fci_token_input.strip()
+if run_fci and not fci_token:
+    st.warning("Enter an FCI API token (or add it to secrets) to run the FCI check.")
+
 build_disabled = not bool(selected_account)
 if st.button("Build completed AM slide", type="primary", disabled=build_disabled):
     try:
         with st.spinner("Building the AM slide workbook..."):
-            term_rows, bridge_rows = build_term_bridge_for_account(sf, selected_account)
+            term_rows, bridge_rows, bridge_fci_rows = build_term_bridge_for_account(sf, selected_account)
             if term_rows.empty and bridge_rows.empty:
                 raise RuntimeError("No term or bridge rows were returned for the selected account.")
 
-            term_rows_with_occ = add_occupancy_to_term_rows(term_rows, occupancy_pivot, period_labels)
-            template_bytes = load_template_bytes()
+            term_rows_with_occ = apply_term_occupancy_to_rows(term_rows, occupancy_lookup, occ_headers)
+
+            fci_alerts = pd.DataFrame()
+            fci_matches = pd.DataFrame()
+            include_fci = bool(
+                run_fci
+                and fci_token
+                and isinstance(bridge_fci_rows, pd.DataFrame)
+                and not bridge_fci_rows.empty
+            )
+            if include_fci:
+                with st.spinner("Checking Bridge loans against FCI..."):
+                    fci_matches, fci_alerts = check_bridge_loans_against_fci(
+                        bridge_fci_rows, api_token=fci_token
+                    )
+
             workbook_bytes, workbook_name = build_workbook_bytes(
                 template_bytes,
                 term_rows_with_occ,
                 bridge_rows,
                 selected_account,
-                period_labels,
+                fci_alerts=fci_alerts,
+                fci_matches=fci_matches,
+                include_fci=include_fci,
             )
 
-        st.session_state["term_preview"] = format_preview(term_rows_with_occ, period_labels)
+        st.session_state["term_preview"] = format_preview(term_rows_with_occ, occ_headers)
         st.session_state["bridge_preview"] = bridge_rows
-        st.session_state["occupancy_debug"] = occupancy_debug
-        st.session_state["occupancy_period_summary"] = occupancy_period_summary
-        st.session_state["period_labels"] = period_labels
         st.session_state["workbook_bytes"] = workbook_bytes
         st.session_state["workbook_name"] = workbook_name
-        st.session_state["match_count"] = int(term_rows_with_occ["Occupancy Matched"].sum()) if not term_rows_with_occ.empty else 0
+        if not term_rows_with_occ.empty and "Occupancy Matched" in term_rows_with_occ.columns:
+            st.session_state["match_count"] = int(term_rows_with_occ["Occupancy Matched"].sum())
+        else:
+            st.session_state["match_count"] = 0
         st.session_state["term_count"] = len(term_rows_with_occ)
+        st.session_state["fci_ran"] = include_fci
+        st.session_state["fci_alerts"] = fci_alerts
+        st.session_state["fci_matches"] = fci_matches
 
         st.success("The AM slide workbook is ready.")
     except Exception as exc:
         st.error(str(normalize_salesforce_error(exc)))
 
-period_labels = st.session_state.get("period_labels", period_labels)
 term_preview = st.session_state.get("term_preview")
 bridge_preview = st.session_state.get("bridge_preview")
-occupancy_debug = st.session_state.get("occupancy_debug")
-occupancy_period_summary = st.session_state.get("occupancy_period_summary", occupancy_period_summary)
 workbook_bytes = st.session_state.get("workbook_bytes")
 workbook_name = st.session_state.get("workbook_name")
 
@@ -1666,15 +2513,34 @@ if isinstance(bridge_preview, pd.DataFrame) and not bridge_preview.empty:
     st.subheader("Bridge preview")
     st.dataframe(bridge_preview, use_container_width=True, hide_index=True)
 
-if isinstance(occupancy_debug, pd.DataFrame) and not occupancy_debug.empty:
-    with st.expander("Occupancy lookup details", expanded=False):
-        st.write(
-            "Using these period columns from the Berkadia file: " + ", ".join(period_labels)
-            if period_labels
-            else "No occupancy periods detected."
+if st.session_state.get("fci_ran"):
+    st.subheader("FCI Bridge late-payment / late-charge check")
+    fci_alerts = st.session_state.get("fci_alerts")
+    fci_matches = st.session_state.get("fci_matches")
+
+    matched_count = 0 if not isinstance(fci_matches, pd.DataFrame) else len(fci_matches)
+    alert_count = 0 if not isinstance(fci_alerts, pd.DataFrame) else len(fci_alerts)
+    metric_a, metric_b = st.columns(2)
+    with metric_a:
+        st.metric("FCI records matched", matched_count)
+    with metric_b:
+        st.metric("Alert rows", alert_count)
+
+    lookup_errors = st.session_state.get("fci_lookup_errors") or []
+    if lookup_errors:
+        with st.expander(f"FCI lookup warnings ({len(lookup_errors)})", expanded=False):
+            for err in lookup_errors:
+                st.text(err)
+
+    if isinstance(fci_alerts, pd.DataFrame) and not fci_alerts.empty:
+        severity_counts = (
+            fci_alerts.groupby("Severity", dropna=False).size().reset_index(name="Count")
         )
-        debug_display = occupancy_debug.copy()
-        debug_display["Occupancy Dec"] = debug_display["Occupancy Dec"].apply(
-            lambda x: "" if pd.isna(x) else f"{x:.1%}"
-        )
-        st.dataframe(debug_display, use_container_width=True, hide_index=True)
+        st.dataframe(severity_counts, use_container_width=True, hide_index=True)
+        st.dataframe(fci_alerts, use_container_width=True, hide_index=True)
+    else:
+        st.info("No late payment or late charge items found for the matched FCI loans.")
+
+    if isinstance(fci_matches, pd.DataFrame) and not fci_matches.empty:
+        with st.expander("FCI matched records", expanded=False):
+            st.dataframe(fci_matches, use_container_width=True, hide_index=True)
