@@ -3,6 +3,9 @@ from __future__ import annotations
 import io
 import json
 import re
+import base64
+import hashlib
+import secrets
 from copy import copy
 from datetime import date, datetime
 from pathlib import Path
@@ -286,8 +289,35 @@ def load_salesforce_oauth_config() -> dict[str, str]:
 
 
 
+@st.cache_resource
+def _pkce_store() -> dict:
+    # Process-level store that survives the redirect to Salesforce and back
+    # (st.session_state does not persist across the full page reload).
+    return {}
+
+
+
+def generate_pkce_pair() -> tuple[str, str]:
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode("ascii")
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+
 def build_salesforce_login_url(oauth_config: dict[str, str]) -> str:
     auth_host = str(oauth_config["auth_host"]).rstrip("/")
+
+    state = secrets.token_urlsafe(24)
+    verifier, challenge = generate_pkce_pair()
+
+    store = _pkce_store()
+    store[state] = verifier
+    # Keep the store from growing without bound across reruns.
+    if len(store) > 50:
+        for old_key in list(store.keys())[:-50]:
+            store.pop(old_key, None)
+
     query = urlencode(
         {
             "response_type": "code",
@@ -295,6 +325,9 @@ def build_salesforce_login_url(oauth_config: dict[str, str]) -> str:
             "redirect_uri": oauth_config["redirect_uri"],
             "scope": oauth_config.get("scope", "api refresh_token"),
             "prompt": oauth_config.get("prompt", "login"),
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
         }
     )
     return f"{auth_host}/services/oauth2/authorize?{query}"
@@ -304,19 +337,21 @@ def build_salesforce_login_url(oauth_config: dict[str, str]) -> str:
 def exchange_salesforce_code_for_token(
     oauth_config: dict[str, str],
     code: str,
+    code_verifier: str | None = None,
 ) -> dict[str, Any]:
     install_truststore()
     auth_host = str(oauth_config["auth_host"]).rstrip("/")
     token_url = f"{auth_host}/services/oauth2/token"
-    payload = urlencode(
-        {
-            "grant_type": "authorization_code",
-            "client_id": oauth_config["client_id"],
-            "client_secret": oauth_config["client_secret"],
-            "redirect_uri": oauth_config["redirect_uri"],
-            "code": code,
-        }
-    ).encode("utf-8")
+    form_fields = {
+        "grant_type": "authorization_code",
+        "client_id": oauth_config["client_id"],
+        "client_secret": oauth_config["client_secret"],
+        "redirect_uri": oauth_config["redirect_uri"],
+        "code": code,
+    }
+    if code_verifier:
+        form_fields["code_verifier"] = code_verifier
+    payload = urlencode(form_fields).encode("utf-8")
     request = Request(
         token_url,
         data=payload,
@@ -390,7 +425,17 @@ def maybe_finish_salesforce_oauth(oauth_config: dict[str, str]) -> None:
         clear_query_params()
         return
 
-    token_payload = exchange_salesforce_code_for_token(oauth_config, code)
+    state = read_query_param("state")
+    code_verifier = _pkce_store().pop(state, None) if state else None
+    if state and not code_verifier:
+        clear_query_params()
+        raise RuntimeError(
+            "Login could not be completed (the PKCE verifier was not found, "
+            "usually because the app restarted between login steps). "
+            "Click 'Log in to Salesforce' and try again."
+        )
+
+    token_payload = exchange_salesforce_code_for_token(oauth_config, code, code_verifier)
     access_token = token_payload.get("access_token")
     instance_url = token_payload.get("instance_url")
     if not access_token or not instance_url:
