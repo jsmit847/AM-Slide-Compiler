@@ -167,6 +167,44 @@ def safe_flatten_recordtype(df: pd.DataFrame) -> pd.DataFrame:
 
 
 
+def clean_text_or_blank(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    if text.lower() in {"nan", "none", "null", "n/a", "na", "-"}:
+        return ""
+    return text
+
+
+
+def deal_record_type_display(row, fallback: str = "") -> str:
+    """
+    Returns the human-readable Opportunity record type for the Portfolio column.
+    Prefers RecordType.Name. Falls back to RecordType.DeveloperName, then provided fallback.
+    """
+    name = clean_text_or_blank(row.get("RecordType.Name", ""))
+    if name:
+        return name
+
+    dev_name = clean_text_or_blank(row.get("RecordType.DeveloperName", ""))
+    if dev_name:
+        return dev_name
+
+    return fallback
+
+
+
+def nonblank_or_fallback(value, fallback: str):
+    value = clean_text_or_blank(value)
+    return value if value else fallback
+
+
+
 def chunked(values, size: int = 200):
     values = list(values)
     for i in range(0, len(values), size):
@@ -690,6 +728,9 @@ def build_term_bridge_for_account(sf: Salesforce, account_name: str):
 
     df_term = pd.DataFrame()
     if not df_term_raw.empty:
+        df_term["Portfolio"] = df_term_raw.apply(
+            lambda row: deal_record_type_display(row, "Term"), axis=1
+        )
         df_term["Loan ID"] = df_term_raw["Deal_Loan_Number__c"].apply(loan_id_5)
         df_term["Loan"] = df_term_raw.get("Name", "")
         df_term["Account Name"] = df_term_raw.get("Account_Name__c", "")
@@ -755,6 +796,9 @@ def build_term_bridge_for_account(sf: Salesforce, account_name: str):
             df_bridge["Servicer Commitment ID"] = df_bridge_opp.get("Servicer_Commitment_Id__c", "")
             df_bridge["Property Servicer IDs"] = (
                 df_bridge["Opportunity Id"].map(prop_servicer_map).fillna("")
+            )
+            df_bridge["Portfolio"] = df_bridge_opp.apply(
+                lambda row: deal_record_type_display(row, "Bridge"), axis=1
             )
             df_bridge["Loan ID"] = df_bridge_opp["Deal_Loan_Number__c"].apply(loan_id_5)
             df_bridge["Loan"] = df_bridge_opp.get("Name", "")
@@ -930,6 +974,9 @@ def build_term_bridge_for_account(sf: Salesforce, account_name: str):
             df_bridge["Servicer Commitment ID"] = bridge_base.get("Servicer_Commitment_Id__c", "")
             df_bridge["Property Servicer IDs"] = (
                 df_bridge["Opportunity Id"].map(prop_servicer_map).fillna("")
+            )
+            df_bridge["Portfolio"] = bridge_base.apply(
+                lambda row: deal_record_type_display(row, "Bridge"), axis=1
             )
             df_bridge["Loan ID"] = bridge_base["Deal_Loan_Number__c"].apply(loan_id_5)
             df_bridge["Loan"] = bridge_base.get("Name", "")
@@ -1768,6 +1815,13 @@ def build_term_occupancy_lookup(berkadia_bytes: bytes, target_quarter_keys=None)
 
         distinct_occ = pool["Occupancy Dec"].dropna().round(6).nunique()
         if distinct_occ > 1:
+            options = pool[[
+                "Freq Norm",
+                "Months Num",
+                "Occupancy Dec",
+                "Occupancy Date_dt",
+                "Investor Loan#",
+            ]].copy()
             issue_rows.append({
                 "Loan ID 5": loan5,
                 "Quarter Key": quarter_key,
@@ -1775,19 +1829,20 @@ def build_term_occupancy_lookup(berkadia_bytes: bytes, target_quarter_keys=None)
                 "Selected Freq": chosen.get("Freq Norm"),
                 "Selected Months": chosen.get("Months Num"),
                 "Selected Occupancy": chosen.get("Occupancy Dec"),
+                "Candidate Rows": options.to_dict("records"),
             })
 
     selected_df = pd.DataFrame(selected_rows)
     issues_df = pd.DataFrame(issue_rows)
 
     if selected_df.empty:
-        return {}, selected_df, issues_df, len(fa)
+        return {}, selected_df, issues_df, fa
 
     lookup = {
         (row["Loan ID 5"], row["Quarter Key"]): row["Occupancy Dec"]
         for _, row in selected_df.iterrows()
     }
-    return lookup, selected_df, issues_df, len(fa)
+    return lookup, selected_df, issues_df, fa
 
 
 @st.cache_data(show_spinner=False)
@@ -2017,7 +2072,7 @@ def sum_money(series) -> float:
 
 
 
-def write_term_sheet(ws, term_rows: pd.DataFrame, occ_headers=None):
+def write_term_sheet(ws, term_rows: pd.DataFrame, guarantor: str = "", occ_headers=None):
     header_row, col_map = find_header_row_and_map(ws, must_have=("portfolio", "loan id"))
     last_col = max(col_map.values())
     total_row = find_total_row(ws, header_row)
@@ -2037,7 +2092,7 @@ def write_term_sheet(ws, term_rows: pd.DataFrame, occ_headers=None):
     for idx, row in term_rows.reset_index(drop=True).iterrows():
         row_num = start_row + idx
         if col("portfolio"):
-            set_cell(ws, row_num, col("portfolio"), "Term")
+            set_cell(ws, row_num, col("portfolio"), nonblank_or_fallback(row.get("Portfolio", ""), "Term"))
         if col("loan id"):
             set_cell(ws, row_num, col("loan id"), row.get("Loan ID", ""))
         if col("loan"):
@@ -2045,7 +2100,7 @@ def write_term_sheet(ws, term_rows: pd.DataFrame, occ_headers=None):
         if col("account name"):
             set_cell(ws, row_num, col("account name"), row.get("Account Name", ""))
         if col("guarantor"):
-            set_cell(ws, row_num, col("guarantor"), row.get("Guarantor", ""))
+            set_cell(ws, row_num, col("guarantor"), row.get("Guarantor", "") or guarantor)
         if col("origination date"):
             set_cell(ws, row_num, col("origination date"), row.get("Origination Date", None), "m/d/yyyy")
         if col("loan amount"):
@@ -2131,7 +2186,7 @@ def write_bridge_sheet(ws, bridge_rows: pd.DataFrame):
     for idx, row in bridge_rows.reset_index(drop=True).iterrows():
         row_num = start_row + idx
         if col("portfolio"):
-            set_cell(ws, row_num, col("portfolio"), "Bridge")
+            set_cell(ws, row_num, col("portfolio"), nonblank_or_fallback(row.get("Portfolio", ""), "Bridge"))
         if col("loan id"):
             set_cell(ws, row_num, col("loan id"), row.get("Loan ID", ""))
         if col("loan name"):
@@ -2242,7 +2297,7 @@ def build_workbook_bytes(
 ):
     workbook = load_workbook(io.BytesIO(template_bytes))
     if TERM_SHEET in workbook.sheetnames:
-        write_term_sheet(workbook[TERM_SHEET], term_rows, occ_headers=None)
+        write_term_sheet(workbook[TERM_SHEET], term_rows, guarantor="", occ_headers=None)
     if BRIDGE_SHEET in workbook.sheetnames:
         write_bridge_sheet(workbook[BRIDGE_SHEET], bridge_rows)
     if include_fci:
@@ -2381,12 +2436,14 @@ if berkadia_file is None:
 occupancy_lookup = {}
 occupancy_selected = pd.DataFrame()
 occupancy_issues = pd.DataFrame()
+occupancy_fa = pd.DataFrame()
 fa_row_count = 0
 try:
-    occupancy_lookup, occupancy_selected, occupancy_issues, fa_row_count = load_occupancy_lookup_cached(
+    occupancy_lookup, occupancy_selected, occupancy_issues, occupancy_fa = load_occupancy_lookup_cached(
         berkadia_file.getvalue(),
         target_quarters,
     )
+    fa_row_count = len(occupancy_fa) if isinstance(occupancy_fa, pd.DataFrame) else int(occupancy_fa)
     st.success(
         f"Berkadia file loaded. Financial Analysis rows read: {fa_row_count}. "
         f"Selected occupancy rows: {len(occupancy_selected)}."
@@ -2423,7 +2480,12 @@ if isinstance(occupancy_selected, pd.DataFrame) and not occupancy_selected.empty
 
 if isinstance(occupancy_issues, pd.DataFrame) and not occupancy_issues.empty:
     with st.expander("Occupancy selection notes", expanded=False):
-        st.dataframe(occupancy_issues, use_container_width=True, hide_index=True)
+        issues_display = occupancy_issues.copy()
+        if "Candidate Rows" in issues_display.columns:
+            issues_display["Candidate Rows"] = issues_display["Candidate Rows"].apply(
+                lambda x: json.dumps(x, default=str) if isinstance(x, (list, dict)) else x
+            )
+        st.dataframe(issues_display, use_container_width=True, hide_index=True)
 
 st.subheader("Step 3: Search Salesforce and choose an account")
 search_col1, search_col2 = st.columns([1, 2])
