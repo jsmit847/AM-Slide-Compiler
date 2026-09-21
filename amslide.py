@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import csv
 import io
 import json
 import re
 import base64
 import hashlib
 import secrets
+import zipfile
 from copy import copy
 from datetime import date, datetime
 from pathlib import Path
@@ -73,6 +75,73 @@ FCI_LOAN_FIELDS = [
     "poffUnpaidLateCharges",
     "poffPaidLateCharges",
 ]
+
+# -------------------------
+# Midland CAF extract settings (McCracken "Enterprise!" bundle)
+# -------------------------
+# The CAF bundle is a .zip of pipe-delimited files. Each file starts with an
+# "A" audit record, then a "C" record holding the column names, then one "D"
+# record per row. Everything below is a constant so the mapping can be retuned
+# without touching the parsing code.
+CAF_DELIMITER = "|"
+CAF_QUOTECHAR = '"'
+CAF_COLUMN_RECORD = "C"
+CAF_DATA_RECORD = "D"
+CAF_DATE_FORMAT = "%m/%d/%Y %H:%M:%S"
+
+# Lower-cased filename fragments used to find each extract inside the .zip.
+# These are matched as substrings of the member's base name, which keeps them
+# unambiguous: "loanextract" does not appear in "LoanToPropertyExtract",
+# "LoanBalancesExtract", "LoanEntityExtract" or any other sibling.
+CAF_RENTROLL_FILE_TOKEN = "rentrollextract"
+CAF_LOAN_TO_PROPERTY_FILE_TOKEN = "loantopropertyextract"
+CAF_LOAN_FILE_TOKEN = "loanextract"
+CAF_ALT_ASSET_ID_FILE_TOKEN = "altassetidextract"
+
+# RentRoll extract: occupancy lives here, keyed by collateral.
+CAF_RR_COLLATERAL_COL = "ColID"
+CAF_RR_PERIOD_DATE_COL = "PRRDt"
+CAF_RR_MASTER_ID_COL = "PRRMstrID"
+CAF_RR_OCC_PCT_COL = "PRRMOccPct"
+CAF_RR_OCC_AMOUNT_COL = "PRRMSqFtUntOcc"
+CAF_RR_TOTAL_AMOUNT_COL = "PRRMTotSqFtUnt"
+CAF_RR_UOM_COL = "PRRMUOMTyp"
+
+# LoanToProperty extract: ties collateral to loans.
+CAF_L2P_COLLATERAL_COL = "ColID"
+CAF_L2P_LOAN_COL = "LnID"
+
+# Loan extract: the roster of real loans, and the fallback loan number for any
+# loan that carries no Investor Loan Number. LnID is the servicer's own key,
+# a 030xxxxxx number that does NOT line up with Salesforce on its own. The
+# first column in the candidate list that exists in the file is used.
+CAF_LOAN_ID_COL = "LnID"
+CAF_LOAN_NUMBER_CANDIDATE_COLUMNS = ["LnID"]
+
+# AltAssetId extract: the Investor Loan Number, which is what Salesforce holds
+# in Deal_Loan_Number__c. Verified against a CAF bundle: 1,175 of 1,198 loans
+# carry one, and those values are either bare 5-digit numbers or 9-digit
+# numbers behind the "6000" prefix that last5_strip_prefix() already removes.
+# The servicer's own LnID matches Salesforce for only the 23 loans that have no
+# Investor Loan Number at all, which is why it is the fallback and not the key.
+CAF_ALT_LOAN_COL = "LnID"
+CAF_ALT_TYPE_COL = "AATyp"
+CAF_ALT_VALUE_COL = "AltLnID"
+CAF_ALT_INVESTOR_LOAN_TYPE = "INVLN"
+# Prefer the Investor Loan Number, falling back to the Loan extract's own
+# number for loans that have none. Set False to key off the Loan extract only.
+CAF_PREFER_INVESTOR_LOAN_NUMBER = True
+# Additionally accept the Loan extract's own number for every loan. Off by
+# default: it adds keys Salesforce does not use and invites false matches.
+CAF_ALSO_MATCH_ON_SERVICER_LOAN_ID = False
+
+# Guarantor scrubbing: a value is treated as an ID rather than a name when it
+# has no letters, when it contains a digit run longer than this, or when it is
+# more digits than letters. Years and small numbers in real entity names pass.
+GUARANTOR_MAX_DIGIT_RUN = 5
+
+# Placeholder written into every otherwise-empty cell of the finished slide.
+BLANK_CELL_PLACEHOLDER = "-"
 
 
 # -------------------------
@@ -202,6 +271,42 @@ def deal_record_type_display(row, fallback: str = "") -> str:
 def nonblank_or_fallback(value, fallback: str):
     value = clean_text_or_blank(value)
     return value if value else fallback
+
+
+
+_GUARANTOR_DIGIT_RUN_RX = re.compile(r"\d{%d,}" % (GUARANTOR_MAX_DIGIT_RUN + 1))
+
+
+def is_junk_guarantor_token(value: Any) -> bool:
+    """
+    True when a guarantor value looks like an identifier rather than a name.
+
+    Catches record ids and bare number strings while keeping real entity names
+    that happen to carry a year or a small number, such as
+    "Colony American Finance 2015-1" or "2020 Main Street Holdings LLC".
+    """
+    text = clean_text_or_blank(value)
+    if text == "":
+        return True
+
+    letters = sum(1 for ch in text if ch.isalpha())
+    digits = sum(1 for ch in text if ch.isdigit())
+
+    if letters == 0:
+        return True
+    if _GUARANTOR_DIGIT_RUN_RX.search(text):
+        return True
+    if digits > letters:
+        return True
+    return False
+
+
+def clean_guarantor_name(value: Any) -> str:
+    """Returns the guarantor name, or blank when the value is ID-like junk."""
+    text = clean_text_or_blank(value)
+    if text == "" or is_junk_guarantor_token(text):
+        return ""
+    return text
 
 
 
@@ -630,6 +735,13 @@ def query_deal_contacts_for_guarantors(sf: Salesforce, opportunity_ids: list[str
     df["GuarantorName"] = df["ContactName"]
     missing_mask = df["GuarantorName"].isna() | (df["GuarantorName"].astype(str).str.strip() == "")
     df.loc[missing_mask, "GuarantorName"] = df.loc[missing_mask, "Name"]
+
+    # Drop ID-like values so they never reach the slide.
+    df["GuarantorName"] = df["GuarantorName"].apply(clean_guarantor_name)
+    df = df[df["GuarantorName"] != ""].copy()
+    if df.empty:
+        return pd.DataFrame(columns=[DC_DEAL_FIELD, "GuarantorName"])
+
     return df[[DC_DEAL_FIELD, "GuarantorName"]].copy()
 
 
@@ -714,7 +826,13 @@ def build_term_bridge_for_account(sf: Salesforce, account_name: str):
                 df_contacts.groupby(DC_DEAL_FIELD)["GuarantorName"]
                 .apply(
                     lambda s: ", ".join(
-                        pd.unique([item for item in s.tolist() if str(item).strip() != ""])
+                        pd.unique(
+                            [
+                                name
+                                for name in (clean_guarantor_name(item) for item in s.tolist())
+                                if name != ""
+                            ]
+                        )
                     )
                 )
                 .reset_index()
@@ -1559,6 +1677,8 @@ def write_fci_alerts_sheet(wb, alerts_df: pd.DataFrame, matches_df: pd.DataFrame
                 if row_fill and col_name == "Severity":
                     cell.fill = row_fill
 
+        fill_blanks_with_dash(ws, start_row + 1, start_row + len(alerts_df), range(1, len(cols) + 1))
+
         start_match_row = start_row + len(alerts_df) + 4
 
     if matches_df is not None and not matches_df.empty:
@@ -1608,6 +1728,10 @@ def write_fci_alerts_sheet(wb, alerts_df: pd.DataFrame, matches_df: pd.DataFrame
                 else:
                     cell.value = excel_safe(val)
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+        fill_blanks_with_dash(
+            ws, header_row + 1, header_row + len(matches_df), range(1, len(match_cols) + 1)
+        )
 
     width_by_col = {
         "A": 14, "B": 28, "C": 12, "D": 18, "E": 22, "F": 30, "G": 50,
@@ -1850,6 +1974,461 @@ def load_occupancy_lookup_cached(berkadia_bytes: bytes, target_quarter_keys: tup
     return build_term_occupancy_lookup(berkadia_bytes, list(target_quarter_keys))
 
 
+# -------------------------
+# Midland occupancy (CAF extract bundle)
+# -------------------------
+def _caf_decode(raw: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "cp1252"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1", errors="replace")
+
+
+
+def _caf_find_member(zip_names, token: str):
+    """
+    Returns the archive member whose base name carries the given extract token.
+
+    Shortest name wins so a token never loses to a longer sibling that happens
+    to contain it.
+    """
+    token = token.lower()
+    matches = [
+        name
+        for name in zip_names
+        if not name.endswith("/") and token in Path(name).name.lower()
+    ]
+    if not matches:
+        return None
+    return sorted(matches, key=lambda name: (len(Path(name).name), name))[0]
+
+
+
+def parse_caf_extract(raw: bytes) -> pd.DataFrame:
+    """
+    Parses one pipe-delimited McCracken CAF extract into a DataFrame.
+
+    Record types live in the first column: "A" is the file audit header, "C"
+    holds the column names and "D" holds the data. Everything is read as text;
+    callers coerce the columns they need.
+    """
+    reader = csv.reader(
+        io.StringIO(_caf_decode(raw), newline=""),
+        delimiter=CAF_DELIMITER,
+        quotechar=CAF_QUOTECHAR,
+    )
+
+    columns = None
+    records: list[list[str]] = []
+    for record in reader:
+        if not record:
+            continue
+        kind = str(record[0]).strip().strip(CAF_QUOTECHAR).upper()
+        if kind == CAF_COLUMN_RECORD:
+            columns = [str(name).strip() for name in record[1:]]
+            continue
+        if kind != CAF_DATA_RECORD or columns is None:
+            continue
+        values = record[1 : len(columns) + 1]
+        if len(values) < len(columns):
+            values = values + [""] * (len(columns) - len(values))
+        records.append(values)
+
+    if columns is None:
+        raise ValueError(
+            "This CAF extract has no 'C' column-name record, so its columns cannot be read."
+        )
+    return pd.DataFrame(records, columns=columns)
+
+
+
+def read_caf_extract_from_zip(zf: zipfile.ZipFile, token: str, label: str, required: bool = True):
+    member = _caf_find_member(zf.namelist(), token)
+    if member is None:
+        if not required:
+            return None
+        available = sorted(Path(name).name for name in zf.namelist() if not name.endswith("/"))
+        raise ValueError(
+            f"Could not find the {label} extract in the CAF .zip (looked for a file name containing "
+            f"'{token}'). Files in the archive: {available}"
+        )
+    with zf.open(member) as handle:
+        return parse_caf_extract(handle.read())
+
+
+
+def _caf_resolve_loan_number_column(loans: pd.DataFrame) -> str:
+    for candidate in CAF_LOAN_NUMBER_CANDIDATE_COLUMNS:
+        if candidate in loans.columns:
+            return candidate
+    raise ValueError(
+        "Could not find a loan-number column in the CAF Loan extract. Tried "
+        f"{CAF_LOAN_NUMBER_CANDIDATE_COLUMNS}. Set CAF_LOAN_NUMBER_CANDIDATE_COLUMNS at the top of "
+        f"amslide.py to one of the available columns: {sorted(loans.columns.tolist())}"
+    )
+
+
+
+def _caf_investor_loan_keys(alt_ids, known_loan_ids: set) -> pd.DataFrame:
+    """
+    Pulls {LnID -> loan_id_5(Investor Loan Number)} out of the AltAssetId extract.
+
+    Only loans the Loan extract actually lists are kept, so a stale alt-id row
+    cannot invent a loan.
+    """
+    empty = pd.DataFrame(columns=["_LnID", "_Loan ID 5"])
+    if alt_ids is None or alt_ids.empty:
+        return empty
+
+    needed = {CAF_ALT_LOAN_COL, CAF_ALT_TYPE_COL, CAF_ALT_VALUE_COL}
+    if not needed.issubset(set(alt_ids.columns)):
+        return empty
+
+    investor = alt_ids[
+        alt_ids[CAF_ALT_TYPE_COL].astype(str).str.strip().str.upper() == CAF_ALT_INVESTOR_LOAN_TYPE
+    ]
+    if investor.empty:
+        return empty
+
+    keys = pd.DataFrame(
+        {
+            "_LnID": investor[CAF_ALT_LOAN_COL].astype(str).str.strip(),
+            "_Loan ID 5": investor[CAF_ALT_VALUE_COL].apply(loan_id_5),
+        }
+    )
+    keys = keys[(keys["_Loan ID 5"] != "") & keys["_LnID"].isin(known_loan_ids)]
+    return keys.drop_duplicates()
+
+
+
+def _caf_build_loan_key_map(loans: pd.DataFrame, alt_ids) -> pd.DataFrame:
+    """
+    Maps each CAF LnID to the 5-digit loan key that Salesforce is joined on.
+
+    The Investor Loan Number from the AltAssetId extract is the number
+    Salesforce carries, so it is used wherever a loan has one. The Loan
+    extract's own number covers the remaining loans.
+    """
+    loan_number_col = _caf_resolve_loan_number_column(loans)
+    if CAF_LOAN_ID_COL not in loans.columns:
+        raise ValueError(
+            f"The CAF Loan extract has no '{CAF_LOAN_ID_COL}' column, so collateral cannot be tied "
+            f"to loans. Available columns: {sorted(loans.columns.tolist())}"
+        )
+
+    servicer_keys = pd.DataFrame(
+        {
+            "_LnID": loans[CAF_LOAN_ID_COL].astype(str).str.strip(),
+            "_Loan ID 5": loans[loan_number_col].apply(loan_id_5),
+        }
+    )
+    servicer_keys = servicer_keys[
+        (servicer_keys["_LnID"] != "") & (servicer_keys["_Loan ID 5"] != "")
+    ].drop_duplicates()
+
+    if not CAF_PREFER_INVESTOR_LOAN_NUMBER:
+        return servicer_keys
+
+    known_loan_ids = set(servicer_keys["_LnID"])
+    investor_keys = _caf_investor_loan_keys(alt_ids, known_loan_ids)
+    if investor_keys.empty:
+        return servicer_keys
+
+    # The Loan extract only covers loans with no Investor Loan Number, unless
+    # servicer ids are explicitly allowed as an extra match.
+    if CAF_ALSO_MATCH_ON_SERVICER_LOAN_ID:
+        fallback = servicer_keys
+    else:
+        fallback = servicer_keys[~servicer_keys["_LnID"].isin(set(investor_keys["_LnID"]))]
+
+    return pd.concat([investor_keys, fallback], ignore_index=True).drop_duplicates()
+
+
+
+def _caf_parse_period_dates(series: pd.Series) -> pd.Series:
+    exact = pd.to_datetime(series, errors="coerce", format=CAF_DATE_FORMAT)
+    if exact.isna().any():
+        loose = pd.to_datetime(series, errors="coerce")
+        exact = exact.fillna(loose)
+    return exact
+
+
+
+def build_midland_occupancy_lookup(caf_zip_bytes: bytes, target_quarter_keys=None):
+    """
+    Builds {(loan_id_5, "YYYY Qn"): occupancy_decimal} from a Midland CAF bundle.
+
+    Occupancy is reported per collateral in the RentRoll extract. Collateral is
+    tied to a loan through LoanToProperty, and the loan number comes from the
+    Investor Loan Number in the AltAssetId extract, falling back to the Loan
+    extract. Per collateral the latest rent roll in each quarter is used,
+    then the collaterals of a loan are rolled up by square feet / units
+    (occupied divided by total), falling back to a plain average of the
+    reported percentages when the totals are missing or zero.
+    """
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(caf_zip_bytes))
+    except zipfile.BadZipFile as exc:
+        raise ValueError(
+            "That file is not a readable .zip archive. Upload the Midland CAF extract bundle."
+        ) from exc
+
+    with archive as zf:
+        rent_roll = read_caf_extract_from_zip(zf, CAF_RENTROLL_FILE_TOKEN, "RentRoll")
+        loan_to_property = read_caf_extract_from_zip(
+            zf, CAF_LOAN_TO_PROPERTY_FILE_TOKEN, "LoanToProperty"
+        )
+        loans = read_caf_extract_from_zip(zf, CAF_LOAN_FILE_TOKEN, "Loan")
+        alt_ids = (
+            read_caf_extract_from_zip(zf, CAF_ALT_ASSET_ID_FILE_TOKEN, "AltAssetId", required=False)
+            if CAF_PREFER_INVESTOR_LOAN_NUMBER
+            else None
+        )
+
+    empty_selected = pd.DataFrame(
+        columns=["Loan ID 5", "Quarter Key", "Occupancy Dec", "Collaterals", "Period End", "Method"]
+    )
+    issue_rows: list[dict[str, Any]] = []
+
+    required_rr = [CAF_RR_COLLATERAL_COL, CAF_RR_PERIOD_DATE_COL, CAF_RR_OCC_PCT_COL]
+    missing_rr = [c for c in required_rr if c not in rent_roll.columns]
+    if missing_rr:
+        raise ValueError(
+            f"The CAF RentRoll extract is missing required columns: {missing_rr}. "
+            f"Available columns: {sorted(rent_roll.columns.tolist())}"
+        )
+
+    missing_l2p = [
+        c for c in (CAF_L2P_COLLATERAL_COL, CAF_L2P_LOAN_COL) if c not in loan_to_property.columns
+    ]
+    if missing_l2p:
+        raise ValueError(
+            f"The CAF LoanToProperty extract is missing required columns: {missing_l2p}. "
+            f"Available columns: {sorted(loan_to_property.columns.tolist())}"
+        )
+
+    loan_keys = _caf_build_loan_key_map(loans, alt_ids)
+
+    rr = rent_roll.copy()
+    rr["_ColID"] = rr[CAF_RR_COLLATERAL_COL].astype(str).str.strip()
+    rr["_Period_dt"] = _caf_parse_period_dates(rr[CAF_RR_PERIOD_DATE_COL])
+    rr["_Occ Pct"] = pd.to_numeric(rr[CAF_RR_OCC_PCT_COL], errors="coerce")
+    if CAF_RR_OCC_AMOUNT_COL in rr.columns:
+        rr["_Occ Amount"] = pd.to_numeric(rr[CAF_RR_OCC_AMOUNT_COL], errors="coerce")
+    else:
+        rr["_Occ Amount"] = pd.Series([None] * len(rr), index=rr.index, dtype="float64")
+    if CAF_RR_TOTAL_AMOUNT_COL in rr.columns:
+        rr["_Total Amount"] = pd.to_numeric(rr[CAF_RR_TOTAL_AMOUNT_COL], errors="coerce")
+    else:
+        rr["_Total Amount"] = pd.Series([None] * len(rr), index=rr.index, dtype="float64")
+    if CAF_RR_UOM_COL in rr.columns:
+        rr["_UOM"] = rr[CAF_RR_UOM_COL].astype(str).str.strip().str.upper()
+    else:
+        rr["_UOM"] = ""
+
+    rent_roll_rows_read = len(rr)
+    rr = rr[(rr["_ColID"] != "") & rr["_Period_dt"].notna()].copy()
+    has_weights = rr["_Occ Amount"].notna() & rr["_Total Amount"].notna()
+    rr = rr[rr["_Occ Pct"].notna() | has_weights].copy()
+
+    if rr.empty:
+        return {}, empty_selected, pd.DataFrame(issue_rows), rent_roll_rows_read
+
+    # A rent roll master repeats its occupancy on every tenant line, so collapse
+    # to one row per collateral / period / master before anything is summed.
+    master_keys = ["_ColID", "_Period_dt"]
+    if CAF_RR_MASTER_ID_COL in rr.columns:
+        rr["_MasterID"] = rr[CAF_RR_MASTER_ID_COL].astype(str).str.strip()
+        master_keys = ["_ColID", "_Period_dt", "_MasterID"]
+    rr = rr.drop_duplicates(subset=master_keys, keep="first").copy()
+
+    rr["Quarter Key"] = (
+        rr["_Period_dt"].dt.year.astype(int).astype(str)
+        + " Q"
+        + rr["_Period_dt"].dt.quarter.astype(int).astype(str)
+    )
+
+    if target_quarter_keys:
+        wanted = list(dict.fromkeys(target_quarter_keys))
+        rr = rr[rr["Quarter Key"].isin(wanted)].copy()
+        if rr.empty:
+            return {}, empty_selected, pd.DataFrame(issue_rows), rent_roll_rows_read
+
+    # Within a quarter keep the latest rent roll for each collateral.
+    rr = rr.sort_values(["_ColID", "Quarter Key", "_Period_dt"], kind="stable")
+    rr = rr.drop_duplicates(subset=["_ColID", "Quarter Key"], keep="last").copy()
+
+    l2p = loan_to_property[[CAF_L2P_COLLATERAL_COL, CAF_L2P_LOAN_COL]].copy()
+    l2p.columns = ["_ColID", "_LnID"]
+    l2p["_ColID"] = l2p["_ColID"].astype(str).str.strip()
+    l2p["_LnID"] = l2p["_LnID"].astype(str).str.strip()
+    l2p = l2p[(l2p["_ColID"] != "") & (l2p["_LnID"] != "")].drop_duplicates()
+
+    merged = rr.merge(l2p, on="_ColID", how="inner").merge(loan_keys, on="_LnID", how="inner")
+    if merged.empty:
+        issue_rows.append(
+            {
+                "Loan ID 5": "",
+                "Quarter Key": "",
+                "Issue": "No rent roll collateral could be tied to a loan in this CAF bundle.",
+            }
+        )
+        return {}, empty_selected, pd.DataFrame(issue_rows), rent_roll_rows_read
+
+    # One collateral counts once per loan-quarter even if it reaches the loan
+    # through more than one LoanToProperty row.
+    merged = merged.drop_duplicates(subset=["_Loan ID 5", "Quarter Key", "_ColID"]).copy()
+
+    selected_rows: list[dict[str, Any]] = []
+    for (loan5, quarter_key), group in merged.groupby(["_Loan ID 5", "Quarter Key"], dropna=False):
+        pool = group
+        uoms = {value for value in group["_UOM"].tolist() if value not in ("", "NAN", "NONE")}
+        if len(uoms) > 1:
+            # Square feet and unit counts cannot be added together, so weight
+            # within whichever unit of measure covers the most of the loan.
+            totals_by_uom = group.groupby("_UOM")["_Total Amount"].sum(min_count=1)
+            totals_by_uom = totals_by_uom[totals_by_uom.index.isin(uoms)].dropna()
+            if not totals_by_uom.empty:
+                dominant = totals_by_uom.idxmax()
+                pool = group[group["_UOM"] == dominant]
+                issue_rows.append(
+                    {
+                        "Loan ID 5": loan5,
+                        "Quarter Key": quarter_key,
+                        "Issue": (
+                            f"Collateral mixes units of measure {sorted(uoms)}; weighted using "
+                            f"'{dominant}' only."
+                        ),
+                    }
+                )
+
+        def average_of_percentages(frame):
+            percentages = frame["_Occ Pct"].dropna()
+            if percentages.empty:
+                return None
+            return float(percentages.mean()) / 100.0
+
+        # A collateral with no total carries no weight, so its occupied count
+        # must not be added either. CAF bundles do contain superseded rows that
+        # repeat the occupied figure against a zero total, and counting those
+        # would push the loan above 100%.
+        carries_weight = pool["_Total Amount"].notna() & (pool["_Total Amount"] > 0)
+        weighted = pool[carries_weight]
+        unweighted = pool[~carries_weight]
+        total_amount = weighted["_Total Amount"].sum(min_count=1)
+        occupied_amount = weighted["_Occ Amount"].sum(min_count=1)
+
+        if pd.notna(total_amount) and pd.notna(occupied_amount) and float(total_amount) > 0:
+            occupancy_dec = float(occupied_amount) / float(total_amount)
+            method = "Weighted by square feet / units"
+            dropped = unweighted[unweighted["_Occ Amount"].fillna(0) > 0]
+            if not dropped.empty:
+                issue_rows.append(
+                    {
+                        "Loan ID 5": loan5,
+                        "Quarter Key": quarter_key,
+                        "Issue": (
+                            f"Ignored {len(dropped)} collateral row(s) that report occupied space "
+                            "against a zero total."
+                        ),
+                    }
+                )
+        else:
+            occupancy_dec = average_of_percentages(pool)
+            if occupancy_dec is None:
+                continue
+            method = "Average of collateral occupancy percentages"
+            issue_rows.append(
+                {
+                    "Loan ID 5": loan5,
+                    "Quarter Key": quarter_key,
+                    "Issue": (
+                        "No usable square feet / unit totals; used the average of the reported "
+                        "occupancy percentages."
+                    ),
+                }
+            )
+
+        if occupancy_dec > 1.0:
+            # An impossible rollup means the underlying counts disagree. The
+            # servicer's own reported percentage is the safer number to show.
+            reported = average_of_percentages(pool)
+            if reported is not None and reported <= 1.0:
+                issue_rows.append(
+                    {
+                        "Loan ID 5": loan5,
+                        "Quarter Key": quarter_key,
+                        "Issue": (
+                            f"Weighted rollup came to {occupancy_dec:.1%}, above 100%; used the "
+                            f"reported occupancy of {reported:.1%} instead."
+                        ),
+                    }
+                )
+                occupancy_dec = reported
+                method = "Average of collateral occupancy percentages"
+            else:
+                issue_rows.append(
+                    {
+                        "Loan ID 5": loan5,
+                        "Quarter Key": quarter_key,
+                        "Issue": (
+                            f"Rolled-up occupancy is {occupancy_dec:.1%}, above 100%. Check the CAF "
+                            "rent roll for this loan."
+                        ),
+                    }
+                )
+
+        selected_rows.append(
+            {
+                "Loan ID 5": loan5,
+                "Quarter Key": quarter_key,
+                "Occupancy Dec": occupancy_dec,
+                "Collaterals": int(pool["_ColID"].nunique()),
+                "Period End": pool["_Period_dt"].max(),
+                "Method": method,
+            }
+        )
+
+    selected_df = pd.DataFrame(selected_rows) if selected_rows else empty_selected
+    issues_df = pd.DataFrame(issue_rows)
+
+    lookup = {
+        (row["Loan ID 5"], row["Quarter Key"]): row["Occupancy Dec"]
+        for _, row in selected_df.iterrows()
+        if row["Loan ID 5"] and pd.notna(row["Occupancy Dec"])
+    }
+    return lookup, selected_df, issues_df, rent_roll_rows_read
+
+
+@st.cache_data(show_spinner=False)
+def load_midland_occupancy_lookup_cached(caf_zip_bytes: bytes, target_quarter_keys: tuple[str, ...]):
+    return build_midland_occupancy_lookup(caf_zip_bytes, list(target_quarter_keys))
+
+
+
+def merge_occupancy_lookups(*lookups) -> dict:
+    """
+    Combines occupancy lookups into one. Earlier arguments win on overlap, so
+    passing Berkadia first keeps Berkadia's value wherever both servicers
+    report the same loan and quarter.
+    """
+    merged: dict = {}
+    for lookup in reversed([item for item in lookups if item]):
+        for key, value in lookup.items():
+            if value is None:
+                continue
+            try:
+                if pd.isna(value):
+                    continue
+            except Exception:
+                pass
+            merged[key] = value
+    return merged
+
+
+
 
 def apply_term_occupancy_to_rows(
     term_rows: pd.DataFrame,
@@ -2072,6 +2651,25 @@ def sum_money(series) -> float:
 
 
 
+
+def fill_blanks_with_dash(ws, first_row, last_row, columns, placeholder: str = BLANK_CELL_PLACEHOLDER) -> None:
+    """
+    Writes a dash into every empty cell of the given block.
+
+    Only None and whitespace-only strings count as empty, so a real zero, a
+    False and an existing dash are all left exactly as they are.
+    """
+    if first_row is None or last_row is None or last_row < first_row:
+        return
+    for row_num in range(int(first_row), int(last_row) + 1):
+        for col_num in columns:
+            cell = ws.cell(row_num, col_num)
+            value = cell.value
+            if value is None or (isinstance(value, str) and value.strip() == ""):
+                cell.value = placeholder
+
+
+
 def write_term_sheet(ws, term_rows: pd.DataFrame, guarantor: str = "", occ_headers=None):
     header_row, col_map = find_header_row_and_map(ws, must_have=("portfolio", "loan id"))
     last_col = max(col_map.values())
@@ -2100,7 +2698,10 @@ def write_term_sheet(ws, term_rows: pd.DataFrame, guarantor: str = "", occ_heade
         if col("account name"):
             set_cell(ws, row_num, col("account name"), row.get("Account Name", ""))
         if col("guarantor"):
-            set_cell(ws, row_num, col("guarantor"), row.get("Guarantor", "") or guarantor)
+            guarantor_value = clean_guarantor_name(row.get("Guarantor", "")) or clean_guarantor_name(
+                guarantor
+            )
+            set_cell(ws, row_num, col("guarantor"), guarantor_value)
         if col("origination date"):
             set_cell(ws, row_num, col("origination date"), row.get("Origination Date", None), "m/d/yyyy")
         if col("loan amount"):
@@ -2164,6 +2765,9 @@ def write_term_sheet(ws, term_rows: pd.DataFrame, guarantor: str = "", occ_heade
         set_cell(ws, total_row, col("total properties"), total_properties, "0")
     if col("total units"):
         set_cell(ws, total_row, col("total units"), total_units, "0")
+
+    # Nothing on the finished slide should read as blank.
+    fill_blanks_with_dash(ws, start_row, start_row + len(term_rows) - 1, sorted(set(col_map.values())))
 
 
 
@@ -2255,6 +2859,11 @@ def write_bridge_sheet(ws, bridge_rows: pd.DataFrame):
     if col("active assets"):
         set_cell(ws, total_row, col("active assets"), total_active, "0")
 
+    # Nothing on the finished slide should read as blank.
+    fill_blanks_with_dash(
+        ws, start_row, start_row + len(bridge_rows) - 1, sorted(set(col_map.values()))
+    )
+
 
 
 def sanitize_filename(name: str) -> str:
@@ -2336,7 +2945,10 @@ def format_preview(df: pd.DataFrame, occ_headers) -> pd.DataFrame:
 # -------------------------
 st.set_page_config(page_title="AM Slides Builder", layout="wide")
 st.title("AM Slides Builder")
-st.caption("Build the AM Slides workbook from Salesforce and a Berkadia Financial Analysis export.")
+st.caption(
+    "Build the AM Slides workbook from Salesforce plus a Berkadia Financial Analysis export, "
+    "a Midland CAF extract bundle, or both."
+)
 
 oauth_config = None
 oauth_setup_error = None
@@ -2415,48 +3027,134 @@ except Exception as exc:
 st.session_state["occ_headers"] = occ_headers
 target_quarters = tuple(item["quarter_key"] for item in occ_headers)
 
-st.subheader("Step 2: Upload the Berkadia servicer file")
+st.subheader("Step 2: Upload the servicer occupancy files")
 st.caption("The AM template workbook is loaded automatically from the repository. You do not need to upload it here.")
 if occ_headers:
     st.caption("Template occupancy quarters: " + ", ".join(target_quarters))
 else:
     st.caption("The Term template has no dated occupancy columns (e.g. '2024 Q1 Occ%'), so occupancy will be left blank.")
+st.caption(
+    "Upload whichever servicers cover this account. Both feed the same quarter columns; where the two "
+    "overlap on a loan and quarter, Berkadia is used."
+)
 
 berkadia_file = st.file_uploader(
-    "Upload Berkadia servicer file",
+    "Berkadia servicer file",
     type=["xlsx", "xlsm"],
     key="berkadia_file",
     help="Use the servicer workbook that contains the Financial Analysis sheet.",
 )
 
-if berkadia_file is None:
-    st.info("Upload the Berkadia servicer file to continue.")
+midland_file = st.file_uploader(
+    "Midland CAF extract bundle (.zip)",
+    type=["zip"],
+    key="midland_file",
+    help=(
+        "Use the CAF extract .zip as downloaded. It must contain the RentRoll, LoanToProperty and "
+        "Loan extracts, which are joined to produce occupancy per loan and quarter."
+    ),
+)
+
+if berkadia_file is None and midland_file is None:
+    st.info("Upload the Berkadia servicer file, the Midland CAF extract bundle, or both, to continue.")
     st.stop()
 
-occupancy_lookup = {}
+berkadia_lookup = {}
 occupancy_selected = pd.DataFrame()
 occupancy_issues = pd.DataFrame()
 occupancy_fa = pd.DataFrame()
 fa_row_count = 0
-try:
-    occupancy_lookup, occupancy_selected, occupancy_issues, occupancy_fa = load_occupancy_lookup_cached(
-        berkadia_file.getvalue(),
-        target_quarters,
+if berkadia_file is not None:
+    try:
+        berkadia_lookup, occupancy_selected, occupancy_issues, occupancy_fa = load_occupancy_lookup_cached(
+            berkadia_file.getvalue(),
+            target_quarters,
+        )
+        fa_row_count = len(occupancy_fa) if isinstance(occupancy_fa, pd.DataFrame) else int(occupancy_fa)
+        st.success(
+            f"Berkadia file loaded. Financial Analysis rows read: {fa_row_count}. "
+            f"Selected occupancy rows: {len(occupancy_selected)}."
+        )
+    except Exception as exc:
+        st.error(f"Berkadia file: {exc}")
+        st.stop()
+
+midland_lookup = {}
+midland_selected = pd.DataFrame()
+midland_issues = pd.DataFrame()
+midland_rows_read = 0
+if midland_file is not None:
+    try:
+        with st.spinner("Reading the Midland CAF extract bundle..."):
+            midland_lookup, midland_selected, midland_issues, midland_rows_read = (
+                load_midland_occupancy_lookup_cached(
+                    midland_file.getvalue(),
+                    target_quarters,
+                )
+            )
+        st.success(
+            f"Midland CAF bundle loaded. Rent roll rows read: {midland_rows_read}. "
+            f"Loan-quarter occupancy rows: {len(midland_selected)}."
+        )
+        if not midland_lookup:
+            st.warning(
+                "The Midland bundle produced no occupancy for the template quarters "
+                f"({', '.join(target_quarters) if target_quarters else 'none defined'}). "
+                "Its rent rolls may not cover those periods."
+            )
+    except Exception as exc:
+        st.error(f"Midland CAF bundle: {exc}")
+        st.stop()
+
+# Berkadia is passed first, so it wins wherever both servicers report the same
+# loan and quarter.
+occupancy_lookup = merge_occupancy_lookups(berkadia_lookup, midland_lookup)
+
+overlap = sorted(set(berkadia_lookup) & set(midland_lookup))
+if overlap:
+    st.caption(
+        f"{len(overlap)} loan-quarter values are reported by both servicers; the Berkadia value was kept."
     )
-    fa_row_count = len(occupancy_fa) if isinstance(occupancy_fa, pd.DataFrame) else int(occupancy_fa)
-    st.success(
-        f"Berkadia file loaded. Financial Analysis rows read: {fa_row_count}. "
-        f"Selected occupancy rows: {len(occupancy_selected)}."
-    )
-except Exception as exc:
-    st.error(str(exc))
-    st.stop()
 
 st.session_state["occupancy_selected"] = occupancy_selected
 st.session_state["occupancy_issues"] = occupancy_issues
+st.session_state["midland_selected"] = midland_selected
+st.session_state["midland_issues"] = midland_issues
+
+if isinstance(midland_selected, pd.DataFrame) and not midland_selected.empty:
+    with st.expander("Review Midland occupancy rows", expanded=False):
+        midland_review_cols = [
+            "Loan ID 5",
+            "Quarter Key",
+            "Occupancy Dec",
+            "Collaterals",
+            "Period End",
+            "Method",
+        ]
+        midland_review_cols = [c for c in midland_review_cols if c in midland_selected.columns]
+        midland_review = midland_selected[midland_review_cols].copy()
+        if "Occupancy Dec" in midland_review.columns:
+            midland_review["Occupancy Dec"] = midland_review["Occupancy Dec"].apply(
+                lambda x: "" if pd.isna(x) else f"{x:.1%}"
+            )
+        if "Period End" in midland_review.columns:
+            midland_review["Period End"] = pd.to_datetime(
+                midland_review["Period End"], errors="coerce"
+            ).dt.strftime("%m/%d/%Y")
+        st.dataframe(
+            midland_review.sort_values(
+                [c for c in ["Loan ID 5", "Quarter Key"] if c in midland_review.columns]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+if isinstance(midland_issues, pd.DataFrame) and not midland_issues.empty:
+    with st.expander(f"Midland occupancy notes ({len(midland_issues)})", expanded=False):
+        st.dataframe(midland_issues, use_container_width=True, hide_index=True)
 
 if isinstance(occupancy_selected, pd.DataFrame) and not occupancy_selected.empty:
-    with st.expander("Review selected occupancy rows", expanded=False):
+    with st.expander("Review selected Berkadia occupancy rows", expanded=False):
         review_cols = [
             "Loan ID 5",
             "Quarter Key",
@@ -2479,7 +3177,7 @@ if isinstance(occupancy_selected, pd.DataFrame) and not occupancy_selected.empty
         )
 
 if isinstance(occupancy_issues, pd.DataFrame) and not occupancy_issues.empty:
-    with st.expander("Occupancy selection notes", expanded=False):
+    with st.expander("Berkadia occupancy selection notes", expanded=False):
         issues_display = occupancy_issues.copy()
         if "Candidate Rows" in issues_display.columns:
             issues_display["Candidate Rows"] = issues_display["Candidate Rows"].apply(
