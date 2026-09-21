@@ -149,6 +149,22 @@ CAF_MIN_LOAN_NUMBER_DIGITS = 5
 CAF_BUNDLE_NAME_RX = re.compile(r"^CAF_Extracts_(\d{2})(\d{2})(\d{2})_\d{4}\.zip$", re.IGNORECASE)
 CAF_RENT_ROLL_LAG_DAYS = 90
 
+# Berkadia data tapes are named like CoreVest_Data_Tape_09_19_2026.xlsx. Unlike
+# a CAF bundle, one tape's Financial Analysis sheet is already a history: a
+# recent tape carries roughly three years of quarters. So the newest tape is
+# normally all that is needed, and older ones are only pulled in when the
+# template reaches back further than the newest tape goes.
+BERKADIA_TAPE_NAME_RX = re.compile(r"_(\d{2})_(\d{2})_(\d{4})\.xls[xm]$", re.IGNORECASE)
+BERKADIA_TAPE_SUFFIXES = (".xlsx", ".xlsm")
+# The folder also holds same-shaped files that are not data tapes, such as
+# CoreVest_Transactions_MTD_09_18_2026.xlsx. Prefer names carrying this hint,
+# and fall back to every dated workbook only when nothing matches.
+BERKADIA_TAPE_NAME_HINT = "data_tape"
+# Archived files sit in year folders and then a per-report folder, for example
+# R:\Berkadia\2026\Data Tape, so two levels down are searched as well.
+SERVICER_FOLDER_SEARCH_DEPTH = 2
+BERKADIA_MAX_TAPES_TO_POOL = 4
+
 # Guarantor scrubbing: a value is treated as an ID rather than a name when it
 # has no letters, when it contains a digit run longer than this, or when it is
 # more digits than letters. Years and small numbers in real entity names pass.
@@ -1983,11 +1999,6 @@ def build_term_occupancy_lookup(berkadia_bytes: bytes, target_quarter_keys=None)
     return lookup, selected_df, issues_df, fa
 
 
-@st.cache_data(show_spinner=False)
-def load_occupancy_lookup_cached(berkadia_bytes: bytes, target_quarter_keys: tuple[str, ...]):
-    return build_term_occupancy_lookup(berkadia_bytes, list(target_quarter_keys))
-
-
 # -------------------------
 # Midland occupancy (CAF extract bundle)
 # -------------------------
@@ -2486,28 +2497,57 @@ def parse_caf_bundle_date(file_name: str):
 
 
 
-def list_caf_bundles_in_folder(folder_path: str):
-    """Returns [(bundle_date, Path)] for every CAF bundle in a folder, oldest first."""
+def resolve_servicer_folder(folder_path: str) -> Path:
     folder = Path(str(folder_path).strip().strip('"')).expanduser()
     if not folder.is_dir():
         raise ValueError(f"'{folder_path}' is not a folder this machine can reach.")
+    return folder
 
-    found = []
-    for item in folder.iterdir():
+
+
+def iter_servicer_folder_files(folder: Path, max_depth: int = SERVICER_FOLDER_SEARCH_DEPTH):
+    """
+    Yields the files in a folder and its subfolders, down to max_depth.
+
+    Servicers archive older files a couple of levels down, so a plain listing
+    of the top folder misses most of the history.
+    """
+    directories = [(folder, 0)]
+    while directories:
+        directory, depth = directories.pop()
         try:
-            if not item.is_file():
-                continue
+            entries = list(directory.iterdir())
         except OSError:
             continue
+        for item in entries:
+            try:
+                if item.is_dir():
+                    if depth < max_depth:
+                        directories.append((item, depth + 1))
+                elif item.is_file():
+                    yield item
+            except OSError:
+                continue
+
+
+
+def list_caf_bundles_in_folder(folder_path: str):
+    """Returns [(bundle_date, Path)] for every CAF bundle in a folder, oldest first."""
+    folder = resolve_servicer_folder(folder_path)
+
+    found = []
+    seen_names: set = set()
+    for item in iter_servicer_folder_files(folder):
         stamp = parse_caf_bundle_date(item.name)
-        if stamp is not None:
+        if stamp is not None and item.name not in seen_names:
+            seen_names.add(item.name)
             found.append((stamp, item))
 
     if not found:
         raise ValueError(
             f"No files named like 'CAF_Extracts_MMDDYY_HHMM.zip' were found in '{folder_path}'."
         )
-    found.sort(key=lambda pair: pair[0])
+    found.sort(key=lambda pair: (pair[0], pair[1].name))
     return found
 
 
@@ -2544,6 +2584,119 @@ def pick_caf_bundles_for_quarters(bundles, quarter_keys, lag_days: int = CAF_REN
         target = quarter_end + timedelta(days=lag_days)
         chosen[quarter_key] = min(bundles, key=lambda pair: abs((pair[0] - target).days))
     return chosen
+
+
+def parse_berkadia_tape_date(file_name: str):
+    """Reads the date out of a name like CoreVest_Data_Tape_09_19_2026.xlsx."""
+    match = BERKADIA_TAPE_NAME_RX.search(Path(file_name).name)
+    if not match:
+        return None
+    month, day, year = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+
+def list_berkadia_tapes_in_folder(folder_path: str, include_subfolders: bool = True):
+    """
+    Returns [(tape_date, Path)] for the Berkadia tapes in a folder, newest first.
+
+    Older tapes are usually filed away in year subfolders, so one level down is
+    searched too. A tape with no date in its name falls back to its file date.
+    """
+    folder = resolve_servicer_folder(folder_path)
+    depth = SERVICER_FOLDER_SEARCH_DEPTH if include_subfolders else 0
+
+    found = []
+    seen: set = set()
+    for item in iter_servicer_folder_files(folder, depth):
+        if item.suffix.lower() not in BERKADIA_TAPE_SUFFIXES:
+            continue
+        if item.name.startswith("~$") or item.name in seen:
+            continue
+        stamp = parse_berkadia_tape_date(item.name)
+        if stamp is None:
+            try:
+                stamp = datetime.fromtimestamp(item.stat().st_mtime).date()
+            except OSError:
+                continue
+        seen.add(item.name)
+        found.append((stamp, item))
+
+    if not found:
+        raise ValueError(f"No Berkadia .xlsx tapes were found in '{folder_path}'.")
+
+    preferred = [
+        pair for pair in found if BERKADIA_TAPE_NAME_HINT in pair[1].name.lower()
+    ]
+    if preferred:
+        found = preferred
+
+    # Newest first, with the name as a tie-break so a given folder always
+    # resolves the same way.
+    found.sort(key=lambda pair: (pair[0], pair[1].name), reverse=True)
+    return found
+
+
+
+def build_berkadia_occupancy_lookup_multi(tape_bytes_list, target_quarter_keys=None):
+    """
+    Runs the Berkadia reader over one or more tapes, newest first, and merges.
+
+    Earlier tapes in the list win on any overlap, so pass the newest first.
+    """
+    tapes = tape_bytes_list
+    if isinstance(tapes, (bytes, bytearray)):
+        tapes = [tapes]
+    tapes = [item for item in tapes if item]
+    if not tapes:
+        raise ValueError("No Berkadia tape was provided.")
+
+    lookups = []
+    selected_parts = []
+    issue_parts = []
+    rows_read = 0
+    for tape_bytes in tapes:
+        lookup, selected, issues, fa = build_term_occupancy_lookup(tape_bytes, target_quarter_keys)
+        lookups.append(lookup)
+        if isinstance(selected, pd.DataFrame) and not selected.empty:
+            selected_parts.append(selected)
+        if isinstance(issues, pd.DataFrame) and not issues.empty:
+            issue_parts.append(issues)
+        rows_read += len(fa) if isinstance(fa, pd.DataFrame) else 0
+
+    merged_lookup = merge_occupancy_lookups(*lookups)
+
+    if selected_parts:
+        merged_selected = pd.concat(selected_parts, ignore_index=True, sort=False)
+        key_cols = [c for c in ("Loan ID 5", "Quarter Key") if c in merged_selected.columns]
+        if key_cols:
+            merged_selected = merged_selected.drop_duplicates(subset=key_cols, keep="first")
+    else:
+        merged_selected = pd.DataFrame()
+
+    merged_issues = (
+        pd.concat(issue_parts, ignore_index=True, sort=False) if issue_parts else pd.DataFrame()
+    )
+    if not merged_issues.empty:
+        merged_issues = merged_issues.drop_duplicates()
+
+    return merged_lookup, merged_selected, merged_issues, rows_read
+
+
+@st.cache_data(show_spinner=False)
+def load_berkadia_occupancy_lookup_cached(
+    tape_bytes_list: tuple[bytes, ...], target_quarter_keys: tuple[str, ...]
+):
+    return build_berkadia_occupancy_lookup_multi(list(tape_bytes_list), list(target_quarter_keys))
+
+
+@st.cache_data(show_spinner=False)
+def read_berkadia_tape_files(file_keys: tuple) -> tuple:
+    """Reads tapes off disk. Keyed on path plus size so edits bust the cache."""
+    return tuple(Path(path).read_bytes() for path, _size in file_keys)
 
 
 @st.cache_data(show_spinner=False)
@@ -3202,6 +3355,75 @@ berkadia_file = st.file_uploader(
     help="Use the servicer workbook that contains the Financial Analysis sheet.",
 )
 
+berkadia_folder_tapes: list[bytes] = []
+with st.expander("Read the Berkadia tape straight from a folder", expanded=False):
+    st.caption(
+        "Nothing is uploaded: the tape is read from disk. One tape's Financial Analysis sheet "
+        "already holds about three years of quarters, so the newest is normally enough. Older "
+        "tapes are only added if the template reaches back further than the newest one goes."
+    )
+    berkadia_folder = st.text_input(
+        "Folder holding the CoreVest_Data_Tape .xlsx files",
+        key="berkadia_folder",
+        placeholder=r"R:\Berkadia",
+    )
+    if berkadia_folder.strip():
+        try:
+            with st.spinner("Looking through the folder..."):
+                tapes_available = list_berkadia_tapes_in_folder(berkadia_folder)
+            chosen_tapes = [tapes_available[0]]
+            st.caption(
+                f"{len(tapes_available)} tapes in that folder; newest is "
+                f"{tapes_available[0][1].name} ({tapes_available[0][0].strftime('%m/%d/%Y')})."
+            )
+            with st.spinner(f"Reading {tapes_available[0][1].name}..."):
+                berkadia_folder_tapes = list(
+                    read_berkadia_tape_files(
+                        tuple((str(path), path.stat().st_size) for _stamp, path in chosen_tapes)
+                    )
+                )
+
+            # Reach further back only when the newest tape leaves a template
+            # quarter empty.
+            if target_quarters:
+                for stamp, path in tapes_available[1:]:
+                    probe, _sel, _iss, _rows = load_berkadia_occupancy_lookup_cached(
+                        tuple(berkadia_folder_tapes), target_quarters
+                    )
+                    still_missing = [q for q in target_quarters if not any(k[1] == q for k in probe)]
+                    if not still_missing:
+                        break
+                    if len(chosen_tapes) >= BERKADIA_MAX_TAPES_TO_POOL:
+                        st.caption(
+                            "Still no data for " + ", ".join(still_missing) + " after reading "
+                            f"{len(chosen_tapes)} tapes; stopping there."
+                        )
+                        break
+                    chosen_tapes.append((stamp, path))
+                    with st.spinner(f"Adding {path.name} for {', '.join(still_missing)}..."):
+                        berkadia_folder_tapes = list(
+                            read_berkadia_tape_files(
+                                tuple(
+                                    (str(item), item.stat().st_size)
+                                    for _d, item in chosen_tapes
+                                )
+                            )
+                        )
+
+            if len(chosen_tapes) > 1:
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {"Tape": path.name, "Tape date": stamp.strftime("%m/%d/%Y")}
+                            for stamp, path in chosen_tapes
+                        ]
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        except Exception as exc:
+            st.error(str(exc))
+
 midland_files = st.file_uploader(
     "Midland CAF extract bundles (.zip)",
     type=["zip"],
@@ -3276,31 +3498,46 @@ with st.expander("Read Midland bundles straight from a folder", expanded=False):
                 st.error(str(exc))
 
 midland_bundle_bytes = [item.getvalue() for item in midland_files] + midland_folder_bundles
+berkadia_tape_bytes = (
+    [berkadia_file.getvalue()] if berkadia_file is not None else []
+) + berkadia_folder_tapes
 
-if berkadia_file is None and not midland_bundle_bytes:
+if not berkadia_tape_bytes and not midland_bundle_bytes:
     st.info(
-        "Upload the Berkadia servicer file, add the Midland CAF extract bundles, or both, to continue."
+        "Add the Berkadia tape, the Midland CAF extract bundles, or both, to continue. Either can "
+        "be uploaded or read from a folder."
     )
     st.stop()
 
 berkadia_lookup = {}
 occupancy_selected = pd.DataFrame()
 occupancy_issues = pd.DataFrame()
-occupancy_fa = pd.DataFrame()
 fa_row_count = 0
-if berkadia_file is not None:
+if berkadia_tape_bytes:
     try:
-        berkadia_lookup, occupancy_selected, occupancy_issues, occupancy_fa = load_occupancy_lookup_cached(
-            berkadia_file.getvalue(),
-            target_quarters,
-        )
-        fa_row_count = len(occupancy_fa) if isinstance(occupancy_fa, pd.DataFrame) else int(occupancy_fa)
+        tape_count = len(berkadia_tape_bytes)
+        tape_noun = "tape" if tape_count == 1 else "tapes"
+        with st.spinner(f"Reading {tape_count} Berkadia {tape_noun}..."):
+            berkadia_lookup, occupancy_selected, occupancy_issues, fa_row_count = (
+                load_berkadia_occupancy_lookup_cached(
+                    tuple(berkadia_tape_bytes),
+                    target_quarters,
+                )
+            )
         st.success(
-            f"Berkadia file loaded. Financial Analysis rows read: {fa_row_count}. "
-            f"Selected occupancy rows: {len(occupancy_selected)}."
+            f"{tape_count} Berkadia {tape_noun} loaded. Financial Analysis rows read: "
+            f"{fa_row_count}. Selected occupancy rows: {len(occupancy_selected)}."
         )
+        if target_quarters:
+            berkadia_missing = [
+                q for q in target_quarters if not any(key[1] == q for key in berkadia_lookup)
+            ]
+            if berkadia_missing and berkadia_lookup:
+                st.warning(
+                    "No Berkadia occupancy for " + ", ".join(berkadia_missing) + "."
+                )
     except Exception as exc:
-        st.error(f"Berkadia file: {exc}")
+        st.error(f"Berkadia tape: {exc}")
         st.stop()
 
 midland_lookup = {}
