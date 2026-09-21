@@ -2497,11 +2497,115 @@ def parse_caf_bundle_date(file_name: str):
 
 
 
+def unc_target_for_drive(drive: str):
+    """
+    Returns the \\\\server\\share behind a mapped Windows drive letter.
+
+    Drive letters are per-logon-session, so a letter that works in Explorer can
+    be missing from the process running this app. The UNC path behind it
+    usually still resolves, which makes it a good fallback.
+    """
+    drive = str(drive).rstrip("\\/")
+    if len(drive) != 2 or not drive.endswith(":"):
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        mpr = ctypes.WinDLL("mpr")
+    except Exception:
+        return None
+
+    size = wintypes.DWORD(2048)
+    buffer = ctypes.create_unicode_buffer(size.value)
+    try:
+        result = mpr.WNetGetConnectionW(ctypes.c_wchar_p(drive), buffer, ctypes.byref(size))
+    except Exception:
+        return None
+
+    # 0 is success; 1201 means the mapping is known but not connected, and the
+    # buffer is filled in either case.
+    if result in (0, 1201) and buffer.value:
+        return buffer.value
+    return None
+
+
+
+def unc_equivalent_path(folder: Path):
+    """Rewrites X:\\some\\folder onto the share that X: points at."""
+    drive = folder.drive
+    if not drive or drive.startswith("\\\\"):
+        return None
+    target = unc_target_for_drive(drive)
+    if not target:
+        return None
+    relative = str(folder)[len(drive):].lstrip("\\/")
+    return Path(target) / relative if relative else Path(target)
+
+
+
+def describe_unreadable_folder(typed: str, folder: Path, attempted_unc) -> str:
+    parts = [f"'{typed}' is not a folder this app can reach."]
+
+    try:
+        if folder.is_file():
+            parts.append("That path is a file, not a folder. Give the folder that contains it.")
+            return " ".join(parts)
+    except OSError:
+        pass
+
+    drive = folder.drive
+    if drive and not drive.startswith("\\\\"):
+        mapped = unc_target_for_drive(drive)
+        if mapped:
+            parts.append(f"{drive} is a mapped network drive pointing at {mapped}.")
+            if attempted_unc is not None:
+                parts.append(f"That share was tried as '{attempted_unc}' and did not open either.")
+            parts.append(
+                "Try pasting the full network path instead of the drive letter, and check the "
+                "account running this app can open that share."
+            )
+        else:
+            parts.append(
+                f"The machine running this app has no {drive} drive. Mapped drive letters belong "
+                "to the Windows session that created them, so a letter that works in Explorer is "
+                "often missing here. Paste the full network path instead, or upload the files."
+            )
+    else:
+        try:
+            parent = folder.parent
+            if parent != folder and parent.is_dir():
+                parts.append(f"Its parent '{parent}' does open, so check the spelling of the last part.")
+        except OSError:
+            pass
+
+    return " ".join(parts)
+
+
+
 def resolve_servicer_folder(folder_path: str) -> Path:
-    folder = Path(str(folder_path).strip().strip('"')).expanduser()
-    if not folder.is_dir():
-        raise ValueError(f"'{folder_path}' is not a folder this machine can reach.")
-    return folder
+    typed = str(folder_path).strip().strip('"').strip("'")
+    if not typed:
+        raise ValueError("Enter a folder path first.")
+
+    folder = Path(typed).expanduser()
+    try:
+        if folder.is_dir():
+            return folder
+    except OSError:
+        pass
+
+    # A mapped drive letter often is not visible to this process, but the share
+    # behind it is.
+    attempted_unc = unc_equivalent_path(folder)
+    if attempted_unc is not None:
+        try:
+            if attempted_unc.is_dir():
+                return attempted_unc
+        except OSError:
+            pass
+
+    raise ValueError(describe_unreadable_folder(typed, folder, attempted_unc))
 
 
 
@@ -3370,7 +3474,10 @@ with st.expander("Read the Berkadia tape straight from a folder", expanded=False
     if berkadia_folder.strip():
         try:
             with st.spinner("Looking through the folder..."):
-                tapes_available = list_berkadia_tapes_in_folder(berkadia_folder)
+                resolved_berkadia = resolve_servicer_folder(berkadia_folder)
+                tapes_available = list_berkadia_tapes_in_folder(resolved_berkadia)
+            if str(resolved_berkadia) != berkadia_folder.strip().strip('"'):
+                st.caption(f"Reading from {resolved_berkadia}")
             chosen_tapes = [tapes_available[0]]
             st.caption(
                 f"{len(tapes_available)} tapes in that folder; newest is "
@@ -3462,8 +3569,11 @@ with st.expander("Read Midland bundles straight from a folder", expanded=False):
         else:
             try:
                 with st.spinner("Looking through the folder..."):
-                    available = list_caf_bundles_in_folder(midland_folder)
+                    resolved_midland = resolve_servicer_folder(midland_folder)
+                    available = list_caf_bundles_in_folder(resolved_midland)
                     picks = pick_caf_bundles_for_quarters(available, target_quarters)
+                if str(resolved_midland) != midland_folder.strip().strip('"'):
+                    st.caption(f"Reading from {resolved_midland}")
                 if not picks:
                     st.warning("No bundle could be matched to a template quarter.")
                 else:
