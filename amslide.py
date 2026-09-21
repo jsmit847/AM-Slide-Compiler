@@ -134,6 +134,10 @@ CAF_PREFER_INVESTOR_LOAN_NUMBER = True
 # Additionally accept the Loan extract's own number for every loan. Off by
 # default: it adds keys Salesforce does not use and invites false matches.
 CAF_ALSO_MATCH_ON_SERVICER_LOAN_ID = False
+# A loan number needs at least this many digits to be believable. The Loan
+# extract carries a few non-loan rows such as "2043Funds", and without this
+# they would turn into invented 5-digit keys that no real loan owns.
+CAF_MIN_LOAN_NUMBER_DIGITS = 5
 
 # Guarantor scrubbing: a value is treated as an ID rather than a name when it
 # has no letters, when it contains a digit run longer than this, or when it is
@@ -2125,7 +2129,12 @@ def _caf_build_loan_key_map(loans: pd.DataFrame, alt_ids) -> pd.DataFrame:
         }
     )
     servicer_keys = servicer_keys[
-        (servicer_keys["_LnID"] != "") & (servicer_keys["_Loan ID 5"] != "")
+        (servicer_keys["_LnID"] != "")
+        & (servicer_keys["_Loan ID 5"] != "")
+        & (
+            servicer_keys["_LnID"].apply(lambda value: len(digits_only(value)))
+            >= CAF_MIN_LOAN_NUMBER_DIGITS
+        )
     ].drop_duplicates()
 
     if not CAF_PREFER_INVESTOR_LOAN_NUMBER:
@@ -2134,7 +2143,17 @@ def _caf_build_loan_key_map(loans: pd.DataFrame, alt_ids) -> pd.DataFrame:
     known_loan_ids = set(servicer_keys["_LnID"])
     investor_keys = _caf_investor_loan_keys(alt_ids, known_loan_ids)
     if investor_keys.empty:
-        return servicer_keys
+        # Falling back here would silently re-key every loan, not just the few
+        # that have no investor number, and the servicer's own LnID lines up
+        # with Salesforce for almost none of them. Stop instead of filling the
+        # slide with occupancy attributed to the wrong loans.
+        raise ValueError(
+            "The CAF bundle has no usable Investor Loan Numbers, so its loans cannot be matched to "
+            f"Salesforce. Expected rows with {CAF_ALT_TYPE_COL}='{CAF_ALT_INVESTOR_LOAN_TYPE}' in the "
+            "AltAssetId extract. Upload the complete CAF .zip rather than a pruned copy. If this feed "
+            "genuinely has no investor numbers, set CAF_PREFER_INVESTOR_LOAN_NUMBER = False at the top "
+            "of amslide.py to key off the Loan extract instead."
+        )
 
     # The Loan extract only covers loans with no Investor Loan Number, unless
     # servicer ids are explicitly allowed as an extra match.
@@ -2181,8 +2200,9 @@ def build_midland_occupancy_lookup(caf_zip_bytes: bytes, target_quarter_keys=Non
             zf, CAF_LOAN_TO_PROPERTY_FILE_TOKEN, "LoanToProperty"
         )
         loans = read_caf_extract_from_zip(zf, CAF_LOAN_FILE_TOKEN, "Loan")
+        # Required, not optional: the Investor Loan Number is the join key.
         alt_ids = (
-            read_caf_extract_from_zip(zf, CAF_ALT_ASSET_ID_FILE_TOKEN, "AltAssetId", required=False)
+            read_caf_extract_from_zip(zf, CAF_ALT_ASSET_ID_FILE_TOKEN, "AltAssetId")
             if CAF_PREFER_INVESTOR_LOAN_NUMBER
             else None
         )
@@ -3048,8 +3068,10 @@ midland_file = st.file_uploader(
     type=["zip"],
     key="midland_file",
     help=(
-        "Use the CAF extract .zip as downloaded. It must contain the RentRoll, LoanToProperty and "
-        "Loan extracts, which are joined to produce occupancy per loan and quarter."
+        "Use the CAF extract .zip exactly as downloaded, without pruning it. It must contain the "
+        "RentRoll, LoanToProperty, Loan and AltAssetId extracts. AltAssetId supplies the Investor "
+        "Loan Number that ties a CAF loan to Salesforce, so occupancy lands on the wrong loans "
+        "without it."
     ),
 )
 
