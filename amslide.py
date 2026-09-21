@@ -100,6 +100,7 @@ CAF_ALT_ASSET_ID_FILE_TOKEN = "altassetidextract"
 
 # RentRoll extract: occupancy lives here, keyed by collateral.
 CAF_RR_COLLATERAL_COL = "ColID"
+CAF_RR_EXTRACT_DATE_COL = "ExtractDate"
 CAF_RR_PERIOD_DATE_COL = "PRRDt"
 CAF_RR_MASTER_ID_COL = "PRRMstrID"
 CAF_RR_OCC_PCT_COL = "PRRMOccPct"
@@ -2175,9 +2176,15 @@ def _caf_parse_period_dates(series: pd.Series) -> pd.Series:
 
 
 
-def build_midland_occupancy_lookup(caf_zip_bytes: bytes, target_quarter_keys=None):
+def build_midland_occupancy_lookup(caf_zip_bundles, target_quarter_keys=None):
     """
-    Builds {(loan_id_5, "YYYY Qn"): occupancy_decimal} from a Midland CAF bundle.
+    Builds {(loan_id_5, "YYYY Qn"): occupancy_decimal} from Midland CAF bundles.
+
+    Accepts one bundle or a list of them. A CAF bundle carries only the latest
+    rent roll for each property, so a single download fills whichever quarter
+    that rent roll happens to fall in and leaves the rest blank. Pass one
+    bundle per quarter wanted and their rent rolls are pooled before the
+    rollup, which is what fills the template's older quarter columns.
 
     Occupancy is reported per collateral in the RentRoll extract. Collateral is
     tied to a loan through LoanToProperty, and the loan number comes from the
@@ -2187,25 +2194,44 @@ def build_midland_occupancy_lookup(caf_zip_bytes: bytes, target_quarter_keys=Non
     (occupied divided by total), falling back to a plain average of the
     reported percentages when the totals are missing or zero.
     """
-    try:
-        archive = zipfile.ZipFile(io.BytesIO(caf_zip_bytes))
-    except zipfile.BadZipFile as exc:
-        raise ValueError(
-            "That file is not a readable .zip archive. Upload the Midland CAF extract bundle."
-        ) from exc
+    bundles = caf_zip_bundles
+    if isinstance(bundles, (bytes, bytearray)):
+        bundles = [bundles]
+    bundles = [item for item in bundles if item]
+    if not bundles:
+        raise ValueError("No Midland CAF bundle was uploaded.")
 
-    with archive as zf:
-        rent_roll = read_caf_extract_from_zip(zf, CAF_RENTROLL_FILE_TOKEN, "RentRoll")
-        loan_to_property = read_caf_extract_from_zip(
-            zf, CAF_LOAN_TO_PROPERTY_FILE_TOKEN, "LoanToProperty"
-        )
-        loans = read_caf_extract_from_zip(zf, CAF_LOAN_FILE_TOKEN, "Loan")
-        # Required, not optional: the Investor Loan Number is the join key.
-        alt_ids = (
-            read_caf_extract_from_zip(zf, CAF_ALT_ASSET_ID_FILE_TOKEN, "AltAssetId")
-            if CAF_PREFER_INVESTOR_LOAN_NUMBER
-            else None
-        )
+    rent_roll_parts = []
+    loan_to_property_parts = []
+    loan_parts = []
+    alt_id_parts = []
+    for position, bundle_bytes in enumerate(bundles, start=1):
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(bundle_bytes))
+        except zipfile.BadZipFile as exc:
+            raise ValueError(
+                f"CAF bundle {position} of {len(bundles)} is not a readable .zip archive. Upload "
+                "the Midland CAF extract bundles exactly as downloaded."
+            ) from exc
+
+        with archive as zf:
+            rent_roll_parts.append(
+                read_caf_extract_from_zip(zf, CAF_RENTROLL_FILE_TOKEN, "RentRoll")
+            )
+            loan_to_property_parts.append(
+                read_caf_extract_from_zip(zf, CAF_LOAN_TO_PROPERTY_FILE_TOKEN, "LoanToProperty")
+            )
+            loan_parts.append(read_caf_extract_from_zip(zf, CAF_LOAN_FILE_TOKEN, "Loan"))
+            # Required, not optional: the Investor Loan Number is the join key.
+            if CAF_PREFER_INVESTOR_LOAN_NUMBER:
+                alt_id_parts.append(
+                    read_caf_extract_from_zip(zf, CAF_ALT_ASSET_ID_FILE_TOKEN, "AltAssetId")
+                )
+
+    rent_roll = pd.concat(rent_roll_parts, ignore_index=True, sort=False)
+    loan_to_property = pd.concat(loan_to_property_parts, ignore_index=True, sort=False)
+    loans = pd.concat(loan_parts, ignore_index=True, sort=False)
+    alt_ids = pd.concat(alt_id_parts, ignore_index=True, sort=False) if alt_id_parts else None
 
     empty_selected = pd.DataFrame(
         columns=["Loan ID 5", "Quarter Key", "Occupancy Dec", "Collaterals", "Period End", "Method"]
@@ -2248,6 +2274,11 @@ def build_midland_occupancy_lookup(caf_zip_bytes: bytes, target_quarter_keys=Non
     else:
         rr["_UOM"] = ""
 
+    if CAF_RR_EXTRACT_DATE_COL in rr.columns:
+        rr["_ExtractDate_dt"] = _caf_parse_period_dates(rr[CAF_RR_EXTRACT_DATE_COL])
+    else:
+        rr["_ExtractDate_dt"] = pd.NaT
+
     rent_roll_rows_read = len(rr)
     rr = rr[(rr["_ColID"] != "") & rr["_Period_dt"].notna()].copy()
     has_weights = rr["_Occ Amount"].notna() & rr["_Total Amount"].notna()
@@ -2262,7 +2293,10 @@ def build_midland_occupancy_lookup(caf_zip_bytes: bytes, target_quarter_keys=Non
     if CAF_RR_MASTER_ID_COL in rr.columns:
         rr["_MasterID"] = rr[CAF_RR_MASTER_ID_COL].astype(str).str.strip()
         master_keys = ["_ColID", "_Period_dt", "_MasterID"]
-    rr = rr.drop_duplicates(subset=master_keys, keep="first").copy()
+    # Bundles overlap, so the same rent roll arrives more than once. Keep the
+    # one from the newest extract in case the servicer restated it.
+    rr = rr.sort_values("_ExtractDate_dt", kind="stable", na_position="first")
+    rr = rr.drop_duplicates(subset=master_keys, keep="last").copy()
 
     rr["Quarter Key"] = (
         rr["_Period_dt"].dt.year.astype(int).astype(str)
@@ -2423,8 +2457,10 @@ def build_midland_occupancy_lookup(caf_zip_bytes: bytes, target_quarter_keys=Non
 
 
 @st.cache_data(show_spinner=False)
-def load_midland_occupancy_lookup_cached(caf_zip_bytes: bytes, target_quarter_keys: tuple[str, ...]):
-    return build_midland_occupancy_lookup(caf_zip_bytes, list(target_quarter_keys))
+def load_midland_occupancy_lookup_cached(
+    caf_zip_bundles: tuple[bytes, ...], target_quarter_keys: tuple[str, ...]
+):
+    return build_midland_occupancy_lookup(list(caf_zip_bundles), list(target_quarter_keys))
 
 
 
@@ -2568,6 +2604,9 @@ def ensure_rows(ws, header_row: int, total_row: int, needed_rows: int, last_col:
     row_b = start_row + 1 if start_row + 1 < total_row else start_row
     a_height, a_styles = snapshot_row_style(ws, row_a, last_col)
     b_height, b_styles = snapshot_row_style(ws, row_b, last_col)
+    # Inserting or deleting rows drags a neighbouring row's height onto the
+    # TOTAL row, so keep its own look and put it back afterwards.
+    total_height, total_styles = snapshot_row_style(ws, total_row, last_col)
 
     if needed_rows > existing_rows:
         add_rows = needed_rows - existing_rows
@@ -2587,6 +2626,13 @@ def ensure_rows(ws, header_row: int, total_row: int, needed_rows: int, last_col:
             b_height if use_alternate else a_height,
             last_col,
         )
+
+    apply_row_style(ws, total_row, total_styles, total_height, last_col)
+
+    # Deleting rows leaves their heights behind, which shows up as banded
+    # empty rows under the TOTAL row.
+    for stale_row in [r for r in ws.row_dimensions if r > total_row]:
+        del ws.row_dimensions[stale_row]
 
     return start_row, total_row
 
@@ -2786,8 +2832,9 @@ def write_term_sheet(ws, term_rows: pd.DataFrame, guarantor: str = "", occ_heade
     if col("total units"):
         set_cell(ws, total_row, col("total units"), total_units, "0")
 
-    # Nothing on the finished slide should read as blank, the TOTAL row included.
-    fill_blanks_with_dash(ws, start_row, total_row, sorted(set(col_map.values())))
+    # Loan rows show a dash rather than a blank. The TOTAL row is left alone:
+    # a dash under a column that has no total reads as a missing figure.
+    fill_blanks_with_dash(ws, start_row, start_row + len(term_rows) - 1, sorted(set(col_map.values())))
 
 
 
@@ -2879,8 +2926,11 @@ def write_bridge_sheet(ws, bridge_rows: pd.DataFrame):
     if col("active assets"):
         set_cell(ws, total_row, col("active assets"), total_active, "0")
 
-    # Nothing on the finished slide should read as blank, the TOTAL row included.
-    fill_blanks_with_dash(ws, start_row, total_row, sorted(set(col_map.values())))
+    # Loan rows show a dash rather than a blank. The TOTAL row is left alone:
+    # a dash under a column that has no total reads as a missing figure.
+    fill_blanks_with_dash(
+        ws, start_row, start_row + len(bridge_rows) - 1, sorted(set(col_map.values()))
+    )
 
 
 
@@ -3063,20 +3113,27 @@ berkadia_file = st.file_uploader(
     help="Use the servicer workbook that contains the Financial Analysis sheet.",
 )
 
-midland_file = st.file_uploader(
-    "Midland CAF extract bundle (.zip)",
+midland_files = st.file_uploader(
+    "Midland CAF extract bundles (.zip)",
     type=["zip"],
-    key="midland_file",
+    key="midland_files",
+    accept_multiple_files=True,
     help=(
-        "Use the CAF extract .zip exactly as downloaded, without pruning it. It must contain the "
-        "RentRoll, LoanToProperty, Loan and AltAssetId extracts. AltAssetId supplies the Investor "
-        "Loan Number that ties a CAF loan to Salesforce, so occupancy lands on the wrong loans "
-        "without it."
+        "Use the CAF extract .zip files exactly as downloaded, without pruning them. Each must "
+        "contain the RentRoll, LoanToProperty, Loan and AltAssetId extracts. AltAssetId supplies "
+        "the Investor Loan Number that ties a CAF loan to Salesforce, so occupancy lands on the "
+        "wrong loans without it."
     ),
 )
+midland_files = list(midland_files or [])
+st.caption(
+    "A CAF bundle holds only the most recent rent roll for each property, so one bundle fills one "
+    "quarter. Upload a bundle from shortly after each quarter end to fill the older columns; "
+    "rent rolls typically arrive two to three months in arrears."
+)
 
-if berkadia_file is None and midland_file is None:
-    st.info("Upload the Berkadia servicer file, the Midland CAF extract bundle, or both, to continue.")
+if berkadia_file is None and not midland_files:
+    st.info("Upload the Berkadia servicer file, the Midland CAF extract bundles, or both, to continue.")
     st.stop()
 
 berkadia_lookup = {}
@@ -3103,27 +3160,37 @@ midland_lookup = {}
 midland_selected = pd.DataFrame()
 midland_issues = pd.DataFrame()
 midland_rows_read = 0
-if midland_file is not None:
+if midland_files:
     try:
-        with st.spinner("Reading the Midland CAF extract bundle..."):
+        count = len(midland_files)
+        noun = "bundle" if count == 1 else "bundles"
+        with st.spinner(f"Reading {count} Midland CAF extract {noun}..."):
             midland_lookup, midland_selected, midland_issues, midland_rows_read = (
                 load_midland_occupancy_lookup_cached(
-                    midland_file.getvalue(),
+                    tuple(item.getvalue() for item in midland_files),
                     target_quarters,
                 )
             )
         st.success(
-            f"Midland CAF bundle loaded. Rent roll rows read: {midland_rows_read}. "
+            f"{count} Midland CAF {noun} loaded. Rent roll rows read: {midland_rows_read}. "
             f"Loan-quarter occupancy rows: {len(midland_selected)}."
         )
         if not midland_lookup:
             st.warning(
-                "The Midland bundle produced no occupancy for the template quarters "
+                "The Midland bundles produced no occupancy for the template quarters "
                 f"({', '.join(target_quarters) if target_quarters else 'none defined'}). "
-                "Its rent rolls may not cover those periods."
+                "Their rent rolls may not cover those periods."
             )
+        else:
+            filled = {key[1] for key in midland_lookup}
+            empty_quarters = [q for q in target_quarters if q not in filled]
+            if empty_quarters:
+                st.warning(
+                    "No Midland occupancy for " + ", ".join(empty_quarters) + ". "
+                    "Add a CAF bundle downloaded shortly after each of those quarter ends."
+                )
     except Exception as exc:
-        st.error(f"Midland CAF bundle: {exc}")
+        st.error(f"Midland CAF bundles: {exc}")
         st.stop()
 
 # Berkadia is passed first, so it wins wherever both servicers report the same
@@ -3140,70 +3207,6 @@ st.session_state["occupancy_selected"] = occupancy_selected
 st.session_state["occupancy_issues"] = occupancy_issues
 st.session_state["midland_selected"] = midland_selected
 st.session_state["midland_issues"] = midland_issues
-
-if isinstance(midland_selected, pd.DataFrame) and not midland_selected.empty:
-    with st.expander("Review Midland occupancy rows", expanded=False):
-        midland_review_cols = [
-            "Loan ID 5",
-            "Quarter Key",
-            "Occupancy Dec",
-            "Collaterals",
-            "Period End",
-            "Method",
-        ]
-        midland_review_cols = [c for c in midland_review_cols if c in midland_selected.columns]
-        midland_review = midland_selected[midland_review_cols].copy()
-        if "Occupancy Dec" in midland_review.columns:
-            midland_review["Occupancy Dec"] = midland_review["Occupancy Dec"].apply(
-                lambda x: "" if pd.isna(x) else f"{x:.1%}"
-            )
-        if "Period End" in midland_review.columns:
-            midland_review["Period End"] = pd.to_datetime(
-                midland_review["Period End"], errors="coerce"
-            ).dt.strftime("%m/%d/%Y")
-        st.dataframe(
-            midland_review.sort_values(
-                [c for c in ["Loan ID 5", "Quarter Key"] if c in midland_review.columns]
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-if isinstance(midland_issues, pd.DataFrame) and not midland_issues.empty:
-    with st.expander(f"Midland occupancy notes ({len(midland_issues)})", expanded=False):
-        st.dataframe(midland_issues, use_container_width=True, hide_index=True)
-
-if isinstance(occupancy_selected, pd.DataFrame) and not occupancy_selected.empty:
-    with st.expander("Review selected Berkadia occupancy rows", expanded=False):
-        review_cols = [
-            "Loan ID 5",
-            "Quarter Key",
-            "Occupancy Dec",
-            "Freq Norm",
-            "Months Num",
-            "Selection Source",
-            "Investor Loan#",
-        ]
-        review_cols = [c for c in review_cols if c in occupancy_selected.columns]
-        review = occupancy_selected[review_cols].copy()
-        if "Occupancy Dec" in review.columns:
-            review["Occupancy Dec"] = review["Occupancy Dec"].apply(
-                lambda x: "" if pd.isna(x) else f"{x:.1%}"
-            )
-        st.dataframe(
-            review.sort_values([c for c in ["Loan ID 5", "Quarter Key"] if c in review.columns]),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-if isinstance(occupancy_issues, pd.DataFrame) and not occupancy_issues.empty:
-    with st.expander("Berkadia occupancy selection notes", expanded=False):
-        issues_display = occupancy_issues.copy()
-        if "Candidate Rows" in issues_display.columns:
-            issues_display["Candidate Rows"] = issues_display["Candidate Rows"].apply(
-                lambda x: json.dumps(x, default=str) if isinstance(x, (list, dict)) else x
-            )
-        st.dataframe(issues_display, use_container_width=True, hide_index=True)
 
 st.subheader("Step 3: Search Salesforce and choose an account")
 search_col1, search_col2 = st.columns([1, 2])
@@ -3337,6 +3340,106 @@ if isinstance(term_preview, pd.DataFrame) and not term_preview.empty:
 if isinstance(bridge_preview, pd.DataFrame) and not bridge_preview.empty:
     st.subheader("Bridge preview")
     st.dataframe(bridge_preview, use_container_width=True, hide_index=True)
+
+berkadia_has_rows = isinstance(occupancy_selected, pd.DataFrame) and not occupancy_selected.empty
+midland_has_rows = isinstance(midland_selected, pd.DataFrame) and not midland_selected.empty
+berkadia_has_notes = isinstance(occupancy_issues, pd.DataFrame) and not occupancy_issues.empty
+midland_has_notes = isinstance(midland_issues, pd.DataFrame) and not midland_issues.empty
+
+if berkadia_has_rows or midland_has_rows or berkadia_has_notes or midland_has_notes:
+    st.subheader("Occupancy detail")
+
+    quarter_col1, quarter_col2 = st.columns(2)
+    with quarter_col1:
+        st.metric("Berkadia loan-quarter values", len(berkadia_lookup))
+    with quarter_col2:
+        st.metric("Midland loan-quarter values", len(midland_lookup))
+
+    if target_quarters:
+        coverage = pd.DataFrame(
+            [
+                {
+                    "Quarter": quarter,
+                    "Berkadia": sum(1 for key in berkadia_lookup if key[1] == quarter),
+                    "Midland": sum(1 for key in midland_lookup if key[1] == quarter),
+                    "Total loans filled": sum(1 for key in occupancy_lookup if key[1] == quarter),
+                }
+                for quarter in target_quarters
+            ]
+        )
+        st.dataframe(coverage, use_container_width=True, hide_index=True)
+
+    if berkadia_has_rows:
+        with st.expander(f"Berkadia occupancy rows ({len(occupancy_selected)})", expanded=False):
+            review_cols = [
+                "Loan ID 5",
+                "Quarter Key",
+                "Occupancy Dec",
+                "Freq Norm",
+                "Months Num",
+                "Selection Source",
+                "Investor Loan#",
+            ]
+            review_cols = [c for c in review_cols if c in occupancy_selected.columns]
+            review = occupancy_selected[review_cols].copy()
+            if "Occupancy Dec" in review.columns:
+                review["Occupancy Dec"] = review["Occupancy Dec"].apply(
+                    lambda x: "" if pd.isna(x) else f"{x:.1%}"
+                )
+            st.dataframe(
+                review.sort_values(
+                    [c for c in ["Loan ID 5", "Quarter Key"] if c in review.columns]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    if berkadia_has_notes:
+        with st.expander(f"Berkadia occupancy notes ({len(occupancy_issues)})", expanded=False):
+            issues_display = occupancy_issues.copy()
+            if "Candidate Rows" in issues_display.columns:
+                issues_display["Candidate Rows"] = issues_display["Candidate Rows"].apply(
+                    lambda x: json.dumps(x, default=str) if isinstance(x, (list, dict)) else x
+                )
+            st.dataframe(issues_display, use_container_width=True, hide_index=True)
+    elif berkadia_has_rows:
+        st.caption("No Berkadia occupancy notes: every loan-quarter resolved cleanly.")
+
+    if midland_has_rows:
+        with st.expander(f"Midland occupancy rows ({len(midland_selected)})", expanded=False):
+            midland_review_cols = [
+                "Loan ID 5",
+                "Quarter Key",
+                "Occupancy Dec",
+                "Collaterals",
+                "Period End",
+                "Method",
+            ]
+            midland_review_cols = [
+                c for c in midland_review_cols if c in midland_selected.columns
+            ]
+            midland_review = midland_selected[midland_review_cols].copy()
+            if "Occupancy Dec" in midland_review.columns:
+                midland_review["Occupancy Dec"] = midland_review["Occupancy Dec"].apply(
+                    lambda x: "" if pd.isna(x) else f"{x:.1%}"
+                )
+            if "Period End" in midland_review.columns:
+                midland_review["Period End"] = pd.to_datetime(
+                    midland_review["Period End"], errors="coerce"
+                ).dt.strftime("%m/%d/%Y")
+            st.dataframe(
+                midland_review.sort_values(
+                    [c for c in ["Loan ID 5", "Quarter Key"] if c in midland_review.columns]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    if midland_has_notes:
+        with st.expander(f"Midland occupancy notes ({len(midland_issues)})", expanded=False):
+            st.dataframe(midland_issues, use_container_width=True, hide_index=True)
+    elif midland_has_rows:
+        st.caption("No Midland occupancy notes: every loan-quarter resolved cleanly.")
 
 if st.session_state.get("fci_ran"):
     st.subheader("FCI Bridge late-payment / late-charge check")
