@@ -2766,8 +2766,8 @@ def write_term_sheet(ws, term_rows: pd.DataFrame, guarantor: str = "", occ_heade
     if col("total units"):
         set_cell(ws, total_row, col("total units"), total_units, "0")
 
-    # Nothing on the finished slide should read as blank.
-    fill_blanks_with_dash(ws, start_row, start_row + len(term_rows) - 1, sorted(set(col_map.values())))
+    # Nothing on the finished slide should read as blank, the TOTAL row included.
+    fill_blanks_with_dash(ws, start_row, total_row, sorted(set(col_map.values())))
 
 
 
@@ -2859,10 +2859,8 @@ def write_bridge_sheet(ws, bridge_rows: pd.DataFrame):
     if col("active assets"):
         set_cell(ws, total_row, col("active assets"), total_active, "0")
 
-    # Nothing on the finished slide should read as blank.
-    fill_blanks_with_dash(
-        ws, start_row, start_row + len(bridge_rows) - 1, sorted(set(col_map.values()))
-    )
+    # Nothing on the finished slide should read as blank, the TOTAL row included.
+    fill_blanks_with_dash(ws, start_row, total_row, sorted(set(col_map.values())))
 
 
 
