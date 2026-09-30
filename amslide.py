@@ -566,6 +566,8 @@ def clear_salesforce_session() -> None:
     for key in [
         "salesforce_auth",
         "account_candidates",
+        "party_candidates",
+        "party_deals",
         "term_preview",
         "bridge_preview",
         "occupancy_selected",
@@ -776,7 +778,249 @@ def query_deal_contacts_for_guarantors(sf: Salesforce, opportunity_ids: list[str
 
 
 
+# -------------------------
+# Sponsor / guarantor search
+# -------------------------
+def record_path_value(record: dict, path: str):
+    """Reads a dotted SOQL path such as 'Contact__r.Name' out of a query record."""
+    value: Any = record
+    for part in path.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+
+def find_party_fields(sf: Salesforce) -> dict:
+    """
+    Works out, from the org's own schema, where sponsors and guarantors live.
+
+    Guarantors are Deal_Contact__c rows with Is_Guarantor__c. Sponsors are
+    looked for the same way (a checkbox or a role picklist on Deal_Contact__c
+    that mentions "sponsor") and also as a sponsor field on the Opportunity
+    itself. Only fields that exist and are filterable are returned, so the
+    queries built from them cannot fail on a missing column.
+    """
+    dc_fields = sf.Deal_Contact__c.describe().get("fields", [])
+    dc_name_paths = ["Name"]
+    dc_sponsor_flags = []
+    dc_sponsor_picklists = []
+    for field in dc_fields:
+        name = field.get("name") or ""
+        label = field.get("label") or ""
+        mentions_sponsor = "sponsor" in name.lower() or "sponsor" in label.lower()
+        field_type = field.get("type")
+        if field_type == "reference" and field.get("relationshipName"):
+            reference_to = [str(item).lower() for item in (field.get("referenceTo") or [])]
+            if "contact" in reference_to or "account" in reference_to:
+                dc_name_paths.append(field["relationshipName"] + ".Name")
+        elif field_type == "boolean" and mentions_sponsor and field.get("filterable", True):
+            dc_sponsor_flags.append(name)
+        elif field_type in ("picklist", "multipicklist") and field.get("filterable", True):
+            sponsor_values = [
+                item.get("value")
+                for item in (field.get("picklistValues") or [])
+                if "sponsor" in str(item.get("value") or "").lower()
+            ]
+            if sponsor_values:
+                dc_sponsor_picklists.append((name, field_type, sponsor_values))
+
+    opp_sponsor_paths = []
+    for field in sf.Opportunity.describe().get("fields", []):
+        name = field.get("name") or ""
+        label = field.get("label") or ""
+        if "sponsor" not in name.lower() and "sponsor" not in label.lower():
+            continue
+        if not field.get("filterable", True):
+            continue
+        if field.get("type") == "reference" and field.get("relationshipName"):
+            opp_sponsor_paths.append(field["relationshipName"] + ".Name")
+        elif field.get("type") in ("string", "picklist", "combobox"):
+            opp_sponsor_paths.append(name)
+
+    return {
+        "dc_name_paths": dc_name_paths,
+        "dc_sponsor_flags": dc_sponsor_flags,
+        "dc_sponsor_picklists": dc_sponsor_picklists,
+        "opp_sponsor_paths": opp_sponsor_paths,
+    }
+
+
+
+def pick_matched_name(values, query_text: str) -> str:
+    """The first candidate name that contains what was typed, else the first usable one."""
+    needle = (query_text or "").strip().casefold()
+    cleaned = [clean_guarantor_name(value) for value in values]
+    cleaned = [value for value in cleaned if value]
+    for value in cleaned:
+        if needle and needle in value.casefold():
+            return value
+    return cleaned[0] if cleaned else ""
+
+
+
+def search_deals_by_party(sf: Salesforce, query_text: str) -> pd.DataFrame:
+    """
+    Every closed deal where a sponsor or guarantor name contains query_text.
+    One row per deal, matched name and role, across all accounts.
+    """
+    columns = ["Party", "Role", "Opportunity Id"]
+    query_text = (query_text or "").strip()
+    if not query_text:
+        return pd.DataFrame(columns=columns)
+
+    fields = find_party_fields(sf)
+    like = soql_quote("%" + query_text + "%")
+    hits: list[dict[str, Any]] = []
+
+    # Deal contacts flagged as guarantor or sponsor.
+    role_clauses = ["Is_Guarantor__c = TRUE"]
+    role_clauses += [f"{flag} = TRUE" for flag in fields["dc_sponsor_flags"]]
+    for name, field_type, values in fields["dc_sponsor_picklists"]:
+        quoted = ", ".join(soql_quote(value) for value in values)
+        operator = "INCLUDES" if field_type == "multipicklist" else "IN"
+        role_clauses.append(f"{name} {operator} ({quoted})")
+    name_clauses = [f"{path} LIKE {like}" for path in fields["dc_name_paths"]]
+    dc_select = ["Id", DC_DEAL_FIELD, "Is_Guarantor__c"] + fields["dc_name_paths"]
+    dc_select += fields["dc_sponsor_flags"]
+    dc_select += [name for name, _type, _values in fields["dc_sponsor_picklists"]]
+    dc_rows, _, _ = try_query_drop_missing(
+        sf,
+        "Deal_Contact__c",
+        list(dict.fromkeys(dc_select)),
+        "(" + " OR ".join(role_clauses) + ") AND (" + " OR ".join(name_clauses) + ")",
+        limit=5000,
+    )
+    for record in dc_rows:
+        party = pick_matched_name(
+            [record_path_value(record, path) for path in reversed(fields["dc_name_paths"])],
+            query_text,
+        )
+        if not party or not record.get(DC_DEAL_FIELD):
+            continue
+        is_sponsor = any(record.get(flag) for flag in fields["dc_sponsor_flags"]) or any(
+            "sponsor" in str(record.get(name) or "").lower()
+            for name, _type, _values in fields["dc_sponsor_picklists"]
+        )
+        if record.get("Is_Guarantor__c"):
+            hits.append({"Party": party, "Role": "Guarantor", "Opportunity Id": record[DC_DEAL_FIELD]})
+        if is_sponsor:
+            hits.append({"Party": party, "Role": "Sponsor", "Opportunity Id": record[DC_DEAL_FIELD]})
+
+    # Sponsor fields held directly on the deal.
+    if fields["opp_sponsor_paths"]:
+        opp_where = (
+            "(" + " OR ".join(f"{path} LIKE {like}" for path in fields["opp_sponsor_paths"]) + ")"
+            + " AND " + valid_stage_clause()
+        )
+        opp_rows, _, _ = try_query_drop_missing(
+            sf, "Opportunity", ["Id"] + fields["opp_sponsor_paths"], opp_where, limit=2000
+        )
+        for record in opp_rows:
+            party = pick_matched_name(
+                [record_path_value(record, path) for path in fields["opp_sponsor_paths"]],
+                query_text,
+            )
+            if party:
+                hits.append({"Party": party, "Role": "Sponsor", "Opportunity Id": record["Id"]})
+
+    if not hits:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(hits).drop_duplicates().reset_index(drop=True)
+
+
+
+def search_matching_parties(sf: Salesforce, query_text: str):
+    """
+    Returns (party summary, deal detail) for a sponsor/guarantor name search.
+    Only deals in VALID_STAGES are kept, the same as the account search.
+    """
+    summary_columns = ["Sponsor / Guarantor", "Role", "loans", "Accounts"]
+    hits = search_deals_by_party(sf, query_text)
+    if hits.empty:
+        return pd.DataFrame(columns=summary_columns), pd.DataFrame()
+
+    deal_ids = hits["Opportunity Id"].dropna().astype(str).unique().tolist()
+    deal_rows: list[dict[str, Any]] = []
+    for group in chunked(deal_ids, 200):
+        where_ids = (
+            "Id IN (" + ", ".join(soql_quote(item) for item in group) + ") AND " + valid_stage_clause()
+        )
+        rows, _, _ = try_query_drop_missing(
+            sf,
+            "Opportunity",
+            ["Id", "Name", "Deal_Loan_Number__c", "Account_Name__c", "StageName", "CloseDate"],
+            where_ids,
+            limit=2000,
+        )
+        deal_rows.extend(rows)
+    if not deal_rows:
+        return pd.DataFrame(columns=summary_columns), pd.DataFrame()
+
+    df_deals = pd.DataFrame(deal_rows).drop(columns=["attributes"], errors="ignore")
+    detail = hits.merge(df_deals, left_on="Opportunity Id", right_on="Id", how="inner")
+    detail = detail.drop(columns=["Id"])
+
+    # One spelling per name, whatever case Salesforce holds it in.
+    detail["Party Key"] = detail["Party"].str.strip().str.casefold()
+    display_name = detail.groupby("Party Key")["Party"].agg(lambda s: s.mode().iloc[0])
+    detail["Party"] = detail["Party Key"].map(display_name)
+
+    summary = (
+        detail.groupby("Party", dropna=False)
+        .agg(
+            Role=("Role", lambda s: " / ".join(sorted(set(s)))),
+            loans=("Opportunity Id", "nunique"),
+            Accounts=("Account_Name__c", lambda s: ", ".join(sorted({str(x) for x in s if pd.notna(x)}))),
+        )
+        .reset_index()
+        .rename(columns={"Party": "Sponsor / Guarantor"})
+        .sort_values(["loans", "Sponsor / Guarantor"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    detail = (
+        detail.groupby(["Party", "Opportunity Id"], dropna=False)
+        .agg(
+            Role=("Role", lambda s: " / ".join(sorted(set(s)))),
+            Deal=("Name", "first"),
+            Loan_Number=("Deal_Loan_Number__c", "first"),
+            Account=("Account_Name__c", "first"),
+            Stage=("StageName", "first"),
+            Close_Date=("CloseDate", "first"),
+        )
+        .reset_index()
+        .rename(columns={"Loan_Number": "Deal Loan Number", "Close_Date": "Close Date"})
+        .sort_values(["Party", "Close Date"], ascending=[True, False])
+        .reset_index(drop=True)
+    )
+    return summary, detail
+
+
+
+def valid_stage_clause() -> str:
+    return "StageName IN (" + ", ".join(soql_quote(stage) for stage in VALID_STAGES) + ")"
+
+
+
 def build_term_bridge_for_account(sf: Salesforce, account_name: str):
+    where_account = "Account_Name__c = " + soql_quote(account_name) + " AND " + valid_stage_clause()
+    return build_term_bridge_for_where(sf, where_account)
+
+
+
+def build_term_bridge_for_deal_ids(sf: Salesforce, deal_ids):
+    deal_ids = [str(item) for item in deal_ids if str(item).strip()]
+    if not deal_ids:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    where_ids = (
+        "Id IN (" + ", ".join(soql_quote(item) for item in deal_ids) + ") AND " + valid_stage_clause()
+    )
+    return build_term_bridge_for_where(sf, where_ids)
+
+
+
+def build_term_bridge_for_where(sf: Salesforce, where_clause: str):
     opportunity_fields = [
         "Id",
         "Name",
@@ -803,19 +1047,11 @@ def build_term_bridge_for_account(sf: Salesforce, account_name: str):
         "Servicer_Commitment_Id__c",
     ]
 
-    where_account = (
-        "Account_Name__c = "
-        + soql_quote(account_name)
-        + " AND StageName IN ("
-        + ", ".join(soql_quote(stage) for stage in VALID_STAGES)
-        + ")"
-    )
-
     rows, _, _ = try_query_drop_missing(
         sf,
         "Opportunity",
         opportunity_fields,
-        where_account,
+        where_clause,
         limit=2000,
         order_by="CloseDate DESC NULLS LAST",
     )
@@ -3702,12 +3938,18 @@ st.session_state["occupancy_issues"] = occupancy_issues
 st.session_state["midland_selected"] = midland_selected
 st.session_state["midland_issues"] = midland_issues
 
-st.subheader("Step 3: Search Salesforce and choose an account")
+PARTY_SEARCH_MODE = "Sponsor / Guarantor"
+
+st.subheader("Step 3: Search Salesforce and choose an account, sponsor or guarantor")
 search_col1, search_col2 = st.columns([1, 2])
 with search_col1:
     search_mode = st.selectbox(
         "Search Salesforce by",
-        ["Account Name", "Deal Name", "Deal Loan Number"],
+        ["Account Name", "Deal Name", "Deal Loan Number", PARTY_SEARCH_MODE],
+        help=(
+            f"{PARTY_SEARCH_MODE} finds every deal, across all accounts, where the name you type "
+            "is a sponsor or a guarantor."
+        ),
     )
 with search_col2:
     search_text = st.text_input("Search text")
@@ -3717,18 +3959,48 @@ if st.button("Search Salesforce", type="secondary"):
         st.error("Enter a search value first.")
     else:
         try:
-            account_candidates = search_matching_accounts(sf, search_mode, search_text)
-            st.session_state["account_candidates"] = account_candidates
-            if account_candidates.empty:
-                st.warning("No matching accounts found.")
+            if search_mode == PARTY_SEARCH_MODE:
+                party_candidates, party_deals = search_matching_parties(sf, search_text)
+                st.session_state["party_candidates"] = party_candidates
+                st.session_state["party_deals"] = party_deals
+                st.session_state["account_candidates"] = pd.DataFrame()
+                if party_candidates.empty:
+                    st.warning("No sponsor or guarantor by that name was found on any closed deal.")
+                else:
+                    st.success(f"Found {len(party_candidates)} matching sponsor / guarantor names.")
             else:
-                st.success(f"Found {len(account_candidates)} matching account candidates.")
+                account_candidates = search_matching_accounts(sf, search_mode, search_text)
+                st.session_state["account_candidates"] = account_candidates
+                st.session_state["party_candidates"] = pd.DataFrame()
+                st.session_state["party_deals"] = pd.DataFrame()
+                if account_candidates.empty:
+                    st.warning("No matching accounts found.")
+                else:
+                    st.success(f"Found {len(account_candidates)} matching account candidates.")
         except Exception as exc:
             st.error(str(normalize_salesforce_error(exc)))
 
 account_candidates = st.session_state.get("account_candidates", pd.DataFrame())
+party_candidates = st.session_state.get("party_candidates", pd.DataFrame())
+party_deals = st.session_state.get("party_deals", pd.DataFrame())
 selected_account = None
-if isinstance(account_candidates, pd.DataFrame) and not account_candidates.empty:
+selected_party = None
+selected_party_deal_ids: list[str] = []
+if isinstance(party_candidates, pd.DataFrame) and not party_candidates.empty:
+    st.dataframe(party_candidates, use_container_width=True, hide_index=True)
+    selected_party = st.selectbox(
+        "Pick the sponsor / guarantor for the AM slide",
+        options=party_candidates["Sponsor / Guarantor"].tolist(),
+    )
+    chosen_deals = party_deals[party_deals["Party"] == selected_party]
+    selected_party_deal_ids = chosen_deals["Opportunity Id"].astype(str).unique().tolist()
+    with st.expander(f"Deals for {selected_party} ({len(selected_party_deal_ids)})", expanded=False):
+        st.dataframe(
+            chosen_deals.drop(columns=["Opportunity Id"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+elif isinstance(account_candidates, pd.DataFrame) and not account_candidates.empty:
     st.dataframe(account_candidates, use_container_width=True, hide_index=True)
     selected_account = st.selectbox(
         "Pick the account for the AM slide",
@@ -3736,6 +4008,8 @@ if isinstance(account_candidates, pd.DataFrame) and not account_candidates.empty
     )
 else:
     st.info("Search Salesforce to load the account list.")
+
+slide_label = selected_party or selected_account
 
 st.subheader("Step 4: Build and download the AM slide")
 
@@ -3757,13 +4031,20 @@ if run_fci and not fci_token:
 if run_fci and not fci_token:
     st.warning("Enter an FCI API token (or add it to secrets) to run the FCI check.")
 
-build_disabled = not bool(selected_account)
+build_disabled = not bool(slide_label)
 if st.button("Build completed AM slide", type="primary", disabled=build_disabled):
     try:
         with st.spinner("Building the AM slide workbook..."):
-            term_rows, bridge_rows, bridge_fci_rows = build_term_bridge_for_account(sf, selected_account)
+            if selected_party:
+                term_rows, bridge_rows, bridge_fci_rows = build_term_bridge_for_deal_ids(
+                    sf, selected_party_deal_ids
+                )
+            else:
+                term_rows, bridge_rows, bridge_fci_rows = build_term_bridge_for_account(
+                    sf, selected_account
+                )
             if term_rows.empty and bridge_rows.empty:
-                raise RuntimeError("No term or bridge rows were returned for the selected account.")
+                raise RuntimeError(f"No term or bridge rows were returned for {slide_label}.")
 
             term_rows_with_occ = apply_term_occupancy_to_rows(term_rows, occupancy_lookup, occ_headers)
 
@@ -3785,7 +4066,7 @@ if st.button("Build completed AM slide", type="primary", disabled=build_disabled
                 template_bytes,
                 term_rows_with_occ,
                 bridge_rows,
-                selected_account,
+                slide_label,
                 fci_alerts=fci_alerts,
                 fci_matches=fci_matches,
                 include_fci=include_fci,
