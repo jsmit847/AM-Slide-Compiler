@@ -8,9 +8,12 @@ import base64
 import calendar
 import hashlib
 import secrets
+import unicodedata
 import zipfile
-from copy import copy
+from copy import copy, deepcopy
 from datetime import date, datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -23,6 +26,13 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from simple_salesforce import Salesforce
+
+try:
+    from pptx import Presentation
+    from pptx.opc.constants import RELATIONSHIP_TYPE as PPTX_RT
+    from pptx.oxml.ns import qn
+except ImportError:  # the Excel workbook still builds without python-pptx
+    Presentation = None
 
 TERM_SHEET = "Term"
 BRIDGE_SHEET = "Bridge"
@@ -172,6 +182,49 @@ GUARANTOR_MAX_DIGIT_RUN = 5
 
 # Placeholder written into every otherwise-empty cell of the finished slide.
 BLANK_CELL_PLACEHOLDER = "-"
+
+# -------------------------
+# PowerPoint slide decks
+# -------------------------
+# The repo copies carry neutral sample text; the second name in each pair is
+# how the templates are named in the AM team's own folder, so a fresh copy
+# dropped in from there works too.
+TERM_PPTX_TEMPLATE_NAMES = ("AM_TERM_SLIDE_TEMPLATE.pptx", "AM TERM SLIDE TEMPLATE.pptx")
+BRIDGE_PPTX_TEMPLATE_NAMES = ("AM_BRIDGE_SLIDE_TEMPLATE.pptx", "AM BRIDGE SLIDE TEMPLATE.pptx")
+TERM_DECK_TITLE = "CAF Asset Management Feedback"
+BRIDGE_DECK_TITLE = "Asset Management Bridge Overview"
+PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+# Empty Total-row cells hold a non-breaking space, as in every finished deck.
+SLIDE_TOTAL_BLANK = "\u00a0"
+
+# Slide geometry, in EMU (12700 per point), measured on the AM team's decks.
+EMU_PER_PT = 12700
+SLIDE_TABLE_TOP_EMU = 1299182            # 102.3pt, just under the intro line
+SLIDE_TABLE_LEFT_EMU = 342900            # 27pt; the tables are 666pt wide
+CONT_SLIDE_TABLE_TOP_EMU = 376224        # 29.6pt on table-only continuation slides
+CONT_SLIDE_TABLE_FLOOR_EMU = 460 * EMU_PER_PT
+SLIDE_TEXT_FLOOR_EMU = 510 * EMU_PER_PT  # page number and footer band sit below this
+COMMENTARY_GAP_EMU = 15 * EMU_PER_PT     # table bottom to the commentary box
+# The commentary renders 12pt, 110% spacing, 5pt before each bullet: text
+# starts 3.6pt into the box, the first line takes 14.62pt and each further
+# line 20.84pt. Room is kept for one more bullet than the template has, which
+# covers most decks (2 bullets in 36 of 44 recent ones, 3 in 6, 4 in 2).
+INTRO_FONT_PT = 12.0                     # the intro line's size in the One Column layout
+COMMENTARY_INSET_EMU = int(3.6 * EMU_PER_PT)
+COMMENTARY_FIRST_LINE_EMU = int(14.62 * EMU_PER_PT)
+COMMENTARY_NEXT_LINE_EMU = int(20.84 * EMU_PER_PT)
+COMMENTARY_SPARE_LINES = 1
+# The Term chart legend's five lines are centered on a box shorter than they
+# are, so they spill 14pt above it; keep the commentary this far clear of that.
+LEGEND_TEXT_HEIGHT_EMU = 48 * EMU_PER_PT
+LEGEND_CLEARANCE_EMU = 8 * EMU_PER_PT
+# Column widths: no column may be narrower than its widest unbreakable value
+# plus this, so a figure like $11,127,500 never splits across lines.
+COLUMN_FIT_SAFETY_EMU = 6350
+COLUMN_WIDTH_STEP_EMU = 6350             # widths move 0.5pt at a time
+COLUMN_WIDTH_MAX_ROUNDS = 80
+# A continuation slide carries at least this many loans along with the Total.
+SLIDE_MIN_LAST_PAGE_ROWS = 3
 
 
 # -------------------------
@@ -580,6 +633,12 @@ def clear_salesforce_session() -> None:
         "fci_alerts",
         "fci_matches",
         "fci_ran",
+        "deck_kinds",
+        "deck_default_name",
+        "deck_title_name",
+        "deck_term_intro",
+        "deck_bridge_intro",
+        "late_term_loans",
     ]:
         st.session_state.pop(key, None)
 
@@ -3409,6 +3468,15 @@ def write_term_sheet(ws, term_rows: pd.DataFrame, guarantor: str = "", occ_heade
         set_cell(ws, total_row, col("loan amount"), int(round(total_loan_amount)) if total_loan_amount else 0, "$#,##0")
     if col("outstanding balance"):
         set_cell(ws, total_row, col("outstanding balance"), int(round(total_upb)) if total_upb else 0, "$#,##0")
+    if col("interest rate"):
+        # The template's =AVERAGE(J3:J9) never follows the inserted rows, so it
+        # averaged the first seven loans only. Write the mean of every loan.
+        rates = [
+            float(value)
+            for value in (term_rows["Rate Dec"].tolist() if "Rate Dec" in term_rows else [])
+            if value is not None and not pd.isna(value)
+        ]
+        set_cell(ws, total_row, col("interest rate"), sum(rates) / len(rates) if rates else None, "0.00%")
     if col("total properties"):
         set_cell(ws, total_row, col("total properties"), total_properties, "0")
     if col("total units"):
@@ -3524,20 +3592,27 @@ def sanitize_filename(name: str) -> str:
 
 
 
-def resolve_repo_template_path() -> Path:
-    candidate_paths = [
-        Path(__file__).resolve().parent / DEFAULT_TEMPLATE_NAME,
-        Path.cwd() / DEFAULT_TEMPLATE_NAME,
-        Path(__file__).resolve().parent / "templates" / DEFAULT_TEMPLATE_NAME,
-        Path.cwd() / "templates" / DEFAULT_TEMPLATE_NAME,
-    ]
-    for candidate_path in candidate_paths:
-        if candidate_path.exists():
-            return candidate_path
+def resolve_repo_file(file_names) -> Path:
+    """First of file_names found next to amslide.py, in the working folder, or in a templates folder there."""
+    for name in file_names:
+        candidate_paths = [
+            Path(__file__).resolve().parent / name,
+            Path.cwd() / name,
+            Path(__file__).resolve().parent / "templates" / name,
+            Path.cwd() / "templates" / name,
+        ]
+        for candidate_path in candidate_paths:
+            if candidate_path.exists():
+                return candidate_path
 
     raise RuntimeError(
-        "Could not find 'Reference AM Templates.xlsx' in the repository. Place it next to amslide.py or inside a templates folder in the repo."
+        f"Could not find '{file_names[0]}' in the repository. Place it next to amslide.py or inside a templates folder in the repo."
     )
+
+
+
+def resolve_repo_template_path() -> Path:
+    return resolve_repo_file((DEFAULT_TEMPLATE_NAME,))
 
 
 def load_template_bytes() -> bytes:
@@ -3573,6 +3648,941 @@ def build_workbook_bytes(
 
 
 
+# -------------------------
+# PowerPoint slide decks: reading the finished workbook
+# -------------------------
+# Workbook headers that name the same column as a slide header.
+SLIDE_HEADER_ALIASES = {"loanname": "loan", "lineoriginationdate": "originationdate"}
+
+
+def slide_header_key(value: Any) -> str:
+    """Header text cut to letters, digits and %, so 'As-Is / ARV' matches 'As-Is/ ARV'."""
+    key = re.sub(r"[^a-z0-9%]+", "", norm_hdr(value))
+    return SLIDE_HEADER_ALIASES.get(key, key)
+
+
+
+def format_slide_value(value: Any, number_format: str, blank: str = BLANK_CELL_PLACEHOLDER) -> str:
+    """A workbook cell's text as Excel displays it under the cell's number format."""
+    if value is None:
+        return blank
+    if isinstance(value, str):
+        text = value.replace("\u00a0", " ").strip()
+        # An uncalculated formula has no value to show.
+        return blank if text == "" or text.startswith("=") else text
+    if isinstance(value, (datetime, date)):
+        return f"{value.month}/{value.day}/{value.year}"
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    try:
+        number = Decimal(value) if isinstance(value, int) else Decimal(repr(float(value)))
+    except (TypeError, ValueError, ArithmeticError):
+        return str(value)
+    if not number.is_finite():
+        return blank
+
+    fmt = (number_format or "General").split(";")[0]
+    if fmt.strip().lower() in ("general", "@", ""):
+        if number == number.to_integral_value():
+            return str(int(number))
+        return format(number.normalize(), "f")
+    is_percent = "%" in fmt
+    decimals = re.search(r"\.(0+)", fmt)
+    places = len(decimals.group(1)) if decimals else 0
+    if is_percent:
+        number *= 100
+    # Excel rounds half away from zero; Python's own formatting would not.
+    rounded = number.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+    body = f"{abs(rounded):,.{places}f}" if "," in fmt else f"{abs(rounded):.{places}f}"
+    sign = "-" if rounded < 0 else ""
+    return f"{sign}{'$' if '$' in fmt else ''}{body}{'%' if is_percent else ''}"
+
+
+
+def read_sheet_for_slides(workbook_bytes: bytes, sheet_name: str):
+    """
+    The finished workbook sheet as (headers, rows, total): headers maps column
+    number to header text, and each row maps column number to (value,
+    number_format). None when the workbook has no such sheet.
+    """
+    workbook = load_workbook(io.BytesIO(workbook_bytes))
+    if sheet_name not in workbook.sheetnames:
+        return None
+    ws = workbook[sheet_name]
+    header_row, col_map = find_header_row_and_map(ws, must_have=("portfolio", "loan id"))
+    total_row = find_total_row(ws, header_row)
+    columns = sorted(set(col_map.values()))
+    headers = {col: str(ws.cell(header_row, col).value).strip() for col in columns}
+
+    def read_row(row_num):
+        return {col: (ws.cell(row_num, col).value, ws.cell(row_num, col).number_format) for col in columns}
+
+    rows = []
+    for row_num in range(header_row + 1, total_row or ws.max_row + 1):
+        row = read_row(row_num)
+        if any(not (v is None or (isinstance(v, str) and not v.strip())) for v, _fmt in row.values()):
+            rows.append(row)
+    return headers, rows, (read_row(total_row) if total_row else None)
+
+
+
+def sheet_records_by_key(sheet) -> list[dict]:
+    """Each body row of read_sheet_for_slides() as {slide_header_key: raw value}."""
+    headers, rows, _total = sheet
+    keys = {col: slide_header_key(text) for col, text in headers.items()}
+    return [{keys[col]: value for col, (value, _fmt) in row.items()} for row in rows]
+
+
+
+# -------------------------
+# PowerPoint slide decks: how PowerPoint wraps table text
+# -------------------------
+# Arial advance widths in 1/1000 em for ASCII 32-126. Arial is metrically
+# identical to Helvetica, so these are the standard Helvetica AFM widths, and
+# no font file is needed on the server.
+ARIAL_WIDTHS = (
+    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278,
+    556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556,
+    1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778,
+    667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556,
+    333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556,
+    556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,
+)
+ARIAL_BOLD_WIDTHS = (
+    278, 333, 474, 556, 556, 889, 722, 238, 333, 333, 389, 584, 278, 333, 278, 278,
+    556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 333, 333, 584, 584, 584, 611,
+    975, 722, 722, 722, 722, 667, 611, 778, 722, 278, 556, 722, 611, 833, 722, 778,
+    667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 333, 278, 333, 584, 556,
+    333, 556, 611, 556, 611, 556, 333, 611, 611, 278, 278, 556, 278, 889, 611, 611,
+    611, 611, 389, 556, 333, 611, 556, 778, 556, 556, 500, 389, 280, 389, 584,
+)
+ARIAL_OTHER_WIDTHS = {
+    "\u00a0": 278, "\u2013": 556, "\u2014": 1000, "\u2018": 222, "\u2019": 222,
+    "\u201c": 333, "\u201d": 333, "\u2022": 350, "\u2026": 1000, "\u00b0": 400,
+}
+# PowerPoint lays text out on a 1/8pt grid: each glyph's advance is rounded to
+# the nearest eighth of a point (measured in PowerPoint across all of ASCII),
+# so at 6pt a digit takes 3.375pt rather than 3.336pt and a space 1.625pt.
+# With that rounding this model reproduced PowerPoint's own line breaks for
+# all but one of 1,365 test rows. Lines are 1.2 x the font size apart.
+PPT_ADVANCE_GRID_PT = 0.125
+PPT_LINE_HEIGHT_PER_PT = 1.2
+
+
+@lru_cache(maxsize=4096)
+def _glyph_emu(ch: str, size_pt: float, bold: bool) -> float:
+    code = ord(ch)
+    widths = ARIAL_BOLD_WIDTHS if bold else ARIAL_WIDTHS
+    if 32 <= code <= 126:
+        units = widths[code - 32]
+    elif ch in ARIAL_OTHER_WIDTHS:
+        units = ARIAL_OTHER_WIDTHS[ch]
+    else:
+        base = unicodedata.normalize("NFKD", ch)[:1]
+        units = widths[ord(base) - 32] if base and 32 <= ord(base) <= 126 else 556
+    points = units * size_pt / 1000.0
+    return round(points / PPT_ADVANCE_GRID_PT) * PPT_ADVANCE_GRID_PT * EMU_PER_PT
+
+
+
+def text_width_emu(text: str, size_pt: float, bold: bool) -> float:
+    return sum(_glyph_emu(ch, size_pt, bold) for ch in text)
+
+
+
+def _break_chunks(word: str) -> list[str]:
+    """A word split after each hyphen: PowerPoint may end a line at 'Non-'."""
+    return re.findall(r"[^-]+-?|-", word)
+
+
+
+@lru_cache(maxsize=65536)
+def text_line_count(text: str, width_emu: int, size_pt: float, bold: bool) -> int:
+    """Lines PowerPoint needs for text in a table cell whose inner width is width_emu."""
+    space = _glyph_emu(" ", size_pt, bold)
+    total = 0
+    for paragraph in (text or "").split("\n"):
+        lines, line_w = 1, 0.0
+        for word in paragraph.split():
+            for idx, chunk in enumerate(_break_chunks(word)):
+                chunk_w = text_width_emu(chunk, size_pt, bold)
+                gap = space if (idx == 0 and line_w > 0) else 0.0
+                if line_w > 0 and line_w + gap + chunk_w > width_emu:
+                    lines += 1
+                    line_w, gap = 0.0, 0.0
+                if line_w == 0 and chunk_w > width_emu:
+                    # Too wide for any line, so PowerPoint breaks it between
+                    # characters, not always where a greedy split would.
+                    for ch in chunk:
+                        ch_w = _glyph_emu(ch, size_pt, bold)
+                        if line_w > 0 and line_w + ch_w > width_emu:
+                            lines += 1
+                            line_w = 0.0
+                        line_w += ch_w
+                    lines += 1
+                else:
+                    line_w += gap + chunk_w
+        total += lines
+    return max(total, 1)
+
+
+
+def longest_unbreakable_emu(text: str, size_pt: float, bold: bool) -> float:
+    widest = 0.0
+    for word in (text or "").split():
+        for chunk in _break_chunks(word):
+            widest = max(widest, text_width_emu(chunk, size_pt, bold))
+    return widest
+
+
+
+# -------------------------
+# PowerPoint slide decks: table rows
+# -------------------------
+def _tc_text(tc) -> str:
+    return "".join(t.text or "" for t in tc.iter(qn("a:t")))
+
+
+
+def _set_text_body(tx_body, text: str) -> None:
+    """
+    Puts text in a text body's first run, so it keeps that run's font, size and
+    colour. Assigning .text instead would reset the run to the default style.
+    """
+    paragraphs = tx_body.findall(qn("a:p"))
+    first = paragraphs[0]
+    for extra in paragraphs[1:]:
+        tx_body.remove(extra)
+    runs = first.findall(qn("a:r"))
+    for extra in first.findall(qn("a:br")) + first.findall(qn("a:fld")) + runs[1:]:
+        first.remove(extra)
+    if runs:
+        runs[0].find(qn("a:t")).text = text
+        return
+    run = first.makeelement(qn("a:r"), {})
+    end_props = first.find(qn("a:endParaRPr"))
+    if end_props is not None:
+        run_props = deepcopy(end_props)
+        run_props.tag = qn("a:rPr")
+        run.append(run_props)
+    t = run.makeelement(qn("a:t"), {})
+    t.text = text
+    run.append(t)
+    if end_props is not None:
+        end_props.addprevious(run)
+    else:
+        first.append(run)
+
+
+
+def _set_paragraph_text(paragraph, text: str) -> None:
+    runs = paragraph.runs
+    if runs:
+        runs[0].text = text
+        for extra in runs[1:]:
+            extra._r.getparent().remove(extra._r)
+    else:
+        paragraph.text = text
+
+
+
+def _tr_is_shaded(tr) -> bool:
+    for tc in tr.tc_lst:
+        tc_pr = tc.find(qn("a:tcPr"))
+        if tc_pr is not None and tc_pr.find(qn("a:solidFill")) is not None:
+            return True
+    return False
+
+
+
+def _tr_without_shading(tr):
+    """The same row with its cell fills switched off: the white band."""
+    plain = deepcopy(tr)
+    for tc in plain.tc_lst:
+        tc_pr = tc.find(qn("a:tcPr"))
+        fill = tc_pr.find(qn("a:solidFill")) if tc_pr is not None else None
+        if fill is not None:
+            fill.addprevious(tc_pr.makeelement(qn("a:noFill"), {}))
+            tc_pr.remove(fill)
+    return plain
+
+
+
+def table_row_donors(tbl):
+    """
+    Copies of the template table's header row, shaded body row, white body row
+    and Total row. Every finished deck bands its loan rows shaded, white,
+    shaded..., and keeps the template's own grey Total row with its column
+    pattern of bold and left-aligned cells, so one donor row would not do. The
+    Bridge template has no white row, so one is made from the shaded row.
+    """
+    rows = list(tbl.tr_lst)
+    total_idx = next(
+        (i for i in range(len(rows) - 1, 0, -1) if _tc_text(rows[i].tc_lst[0]).strip().lower() == "total"),
+        None,
+    )
+    body = rows[1:total_idx] if total_idx else rows[1:]
+    shaded = next((tr for tr in body if _tr_is_shaded(tr)), None)
+    plain = next((tr for tr in body if not _tr_is_shaded(tr)), None)
+    if shaded is None and plain is None:
+        raise ValueError("The slide template's table has no sample loan row to copy.")
+    shaded = deepcopy(shaded if shaded is not None else plain)
+    plain = deepcopy(plain) if plain is not None else _tr_without_shading(shaded)
+    total = deepcopy(rows[total_idx]) if total_idx else deepcopy(shaded)
+    return deepcopy(rows[0]), shaded, plain, total
+
+
+
+def _tc_font(tc):
+    """(size in points, bold) of a table cell's first run."""
+    run_props = tc.find(".//" + qn("a:rPr"))
+    if run_props is None:
+        run_props = tc.find(".//" + qn("a:endParaRPr"))
+    if run_props is None:
+        return 18.0, False
+    return int(run_props.get("sz", "1800")) / 100.0, run_props.get("b") in ("1", "true")
+
+
+
+def _tc_margins(tc):
+    """(left, right, top, bottom) cell margins in EMU, with DrawingML's defaults."""
+    tc_pr = tc.find(qn("a:tcPr"))
+
+    def margin(name, default):
+        return int(tc_pr.get(name, default)) if tc_pr is not None else default
+
+    return margin("marL", 91440), margin("marR", 91440), margin("marT", 45720), margin("marB", 45720)
+
+
+
+def _row_cells(donor_tr, texts, min_height: int):
+    """One table row as (text, size_pt, bold, margin_left, margin_right, vertical_padding, min_height) per cell."""
+    cells = []
+    for tc, text in zip(donor_tr.tc_lst, texts):
+        size, bold = _tc_font(tc)
+        mar_l, mar_r, mar_t, mar_b = _tc_margins(tc)
+        cells.append((text, size, bold, mar_l, mar_r, mar_t + mar_b, min_height))
+    return cells
+
+
+
+def _cell_height_emu(cell, width: int) -> float:
+    text, size, bold, mar_l, mar_r, pad, _min_height = cell
+    lines = text_line_count(text, int(width - mar_l - mar_r), size, bold)
+    return lines * size * PPT_LINE_HEIGHT_PER_PT * EMU_PER_PT + pad
+
+
+
+def row_height_emu(cells, widths) -> int:
+    """The height PowerPoint gives a row: its tallest cell, or the row's stored minimum."""
+    tallest = max(_cell_height_emu(cell, width) for cell, width in zip(cells, widths))
+    return int(max(cells[0][6], tallest) + 0.5)
+
+
+
+def balance_column_widths(widths, grid):
+    """
+    Re-splits a table's fixed total width between its columns, as the analysts
+    do by hand on almost every deck. grid holds every row that will appear
+    (header, loans, Total) in _row_cells() form.
+
+    No column ends up narrower than its widest figure or word, so values like
+    "$11,127,500" stay on one line. Then, a round at a time, the column that
+    saves the most table height for the least extra width is widened, paid for
+    by columns that can give width up without growing any row.
+    """
+    widths = [int(w) for w in widths]
+    n_cols, n_rows = len(widths), len(grid)
+    if not grid or n_cols == 0:
+        return widths
+    need = [0] * n_cols
+    for row in grid:
+        for c, (text, size, bold, mar_l, mar_r, _pad, _min_h) in enumerate(row[:n_cols]):
+            fit = longest_unbreakable_emu(text, size, bold) + mar_l + mar_r + COLUMN_FIT_SAFETY_EMU
+            need[c] = max(need[c], int(fit) + 1)
+    if sum(need) > sum(widths):
+        return widths  # cannot fit every value; keep the template's grid
+
+    # 1) Lift every column to its minimum, paid for by the columns with room.
+    deficit = sum(max(0, need[c] - widths[c]) for c in range(n_cols))
+    widths = [max(widths[c], need[c]) for c in range(n_cols)]
+    while deficit > 0:
+        slack = [widths[c] - need[c] for c in range(n_cols)]
+        total_slack = sum(s for s in slack if s > 0)
+        if total_slack <= 0:
+            break
+        for c in range(n_cols):
+            if deficit <= 0:
+                break
+            if slack[c] > 0:
+                take = min(slack[c], deficit, max(1, round(deficit * slack[c] / total_slack)))
+                widths[c] -= take
+                deficit -= take
+
+    # 2) Trade width for height. Every row's height only falls as a column
+    # widens, which is what makes the binary searches below valid.
+    floor = [max(cell[6] for cell in row) for row in grid]
+    cache: dict = {}
+
+    def column(c, width):
+        key = (c, width)
+        if key not in cache:
+            cache[key] = [_cell_height_emu(grid[r][c], width) for r in range(n_rows)]
+        return cache[key]
+
+    def tops_of(cols):
+        tops = []
+        for r in range(n_rows):
+            first, second, owner = 0.0, 0.0, -1
+            for c in range(n_cols):
+                value = cols[c][r]
+                if value > first:
+                    first, second, owner = value, first, c
+                elif value > second:
+                    second = value
+            tops.append((first, second, owner))
+        return tops
+
+    def height_with(tops, c, col):
+        return sum(
+            max(floor[r], col[r], tops[r][1] if tops[r][2] == c else tops[r][0]) for r in range(n_rows)
+        )
+
+    step = COLUMN_WIDTH_STEP_EMU
+    lookahead = 80  # widen a column by up to 40pt to save a line
+    for _round in range(COLUMN_WIDTH_MAX_ROUNDS):
+        cols = [column(c, widths[c]) for c in range(n_cols)]
+        tops = tops_of(cols)
+        current = sum(max(floor[r], tops[r][0]) for r in range(n_rows))
+        offers = []
+        for c in range(n_cols):
+            if height_with(tops, c, column(c, widths[c] + lookahead * step)) >= current:
+                continue
+            low, high = 1, lookahead
+            while low < high:
+                mid = (low + high) // 2
+                if height_with(tops, c, column(c, widths[c] + mid * step)) < current:
+                    high = mid
+                else:
+                    low = mid + 1
+            gain = current - height_with(tops, c, column(c, widths[c] + low * step))
+            offers.append((gain / low, -c, c, low))
+
+        moved = False
+        for _ratio, _tie, receiver, k in sorted(offers, reverse=True):
+            trial = list(widths)
+            trial[receiver] += k * step
+            trial_cols = [column(c, trial[c]) for c in range(n_cols)]
+            trial_tops = tops_of(trial_cols)
+            base = sum(max(floor[r], trial_tops[r][0]) for r in range(n_rows))
+            # Width each other column can give up without growing any row.
+            free = {}
+            for c in range(n_cols):
+                if c == receiver:
+                    continue
+                low, high = 0, max(0, (trial[c] - need[c]) // step)
+                while low < high:
+                    mid = (low + high + 1) // 2
+                    if height_with(trial_tops, c, column(c, trial[c] - mid * step)) <= base:
+                        low = mid
+                    else:
+                        high = mid - 1
+                if low:
+                    free[c] = low
+            if sum(free.values()) < k:
+                continue
+            owed = k
+            for c in sorted(free, key=lambda d: (-free[d], d)):
+                take = min(free[c], owed)
+                trial[c] -= take * step
+                owed -= take
+                if owed == 0:
+                    break
+            widths = trial
+            moved = True
+            break
+        if not moved:
+            break
+    return widths
+
+
+
+def paginate_rows(body_heights, header_height: int, total_height: int, first_budget: int, later_budget: int):
+    """
+    Splits loan rows into slides by rendered height. Every slide repeats the
+    header; the Total row closes the last slide and never sits there alone.
+    """
+    pages, current, used, budget = [], [], header_height, first_budget
+    for idx, height in enumerate(body_heights):
+        if current and used + height > budget:
+            pages.append(current)
+            current, used, budget = [], header_height, later_budget
+        current.append(idx)
+        used += height
+    if current and used + total_height > budget and len(current) > 1:
+        moved = current.pop()
+        pages.append(current)
+        current = [moved]
+    pages.append(current)
+
+    # Don't leave one or two loans stranded with the Total on a slide of
+    # their own: pull rows down from the slide before while they still fit.
+    if len(pages) > 1:
+        last, before = pages[-1], pages[-2]
+        last_used = header_height + total_height + sum(body_heights[i] for i in last)
+        while (
+            len(last) < SLIDE_MIN_LAST_PAGE_ROWS
+            and len(before) > SLIDE_MIN_LAST_PAGE_ROWS
+            and last_used + body_heights[before[-1]] <= later_budget
+        ):
+            last_used += body_heights[before[-1]]
+            last.insert(0, before.pop())
+    return pages
+
+
+
+# -------------------------
+# PowerPoint slide decks: slide text
+# -------------------------
+_NAME_NICKNAME_RX = re.compile(r"\s[\"\u201c'\u2018][^\s\"\u201d'\u2019]+[\"\u201d'\u2019](?=\s)")
+_NAME_SUFFIX_RX = re.compile(r",?\s+(?:jr|sr)\.?$", re.IGNORECASE)
+_NAME_ROMAN_RX = re.compile(r"^(?:i{1,3}|iv|vi{0,3})$", re.IGNORECASE)
+_NAME_ENTITY_TAIL_RX = re.compile(r"^(?:l\.?l\.?c\.?|inc\.?|l\.?p\.?|l\.?l\.?p\.?|ltd\.?|corp\.?|co\.?)$", re.IGNORECASE)
+
+
+def _title_word(word: str) -> str:
+    return "-".join(
+        "'".join(piece[:1].upper() + piece[1:].lower() for piece in part.split("'"))
+        for part in word.split("-")
+    )
+
+
+
+def intro_person_name(raw: Any) -> str:
+    """
+    A guarantor as the decks' intro line writes them: nicknames in quotes and
+    Sr./Jr. dropped, initials written with a period dropped ("Alex W. Severyn"
+    -> "Alex Severyn"), and ALL-CAPS names title-cased.
+    """
+    text = clean_guarantor_name(raw)
+    if text.lower() in ("", "-", "n/a", "na", "none"):
+        return ""
+    text = _NAME_NICKNAME_RX.sub(" ", f" {text} ")
+    text = _NAME_SUFFIX_RX.sub("", re.sub(r"\s+", " ", text).strip())
+    parts = text.split(" ")
+    if len(parts) > 2:
+        parts = [parts[0]] + [p for p in parts[1:-1] if not re.fullmatch(r"[A-Za-z]\.", p)] + [parts[-1]]
+    if text.upper() == text and any(ch.isalpha() for ch in text):
+        parts = [p.upper() if _NAME_ROMAN_RX.match(p) else _title_word(p) for p in parts]
+    return " ".join(parts)
+
+
+
+def guarantor_intro_names(guarantor_cells) -> list[str]:
+    """Distinct guarantors in order of first appearance down the table."""
+    names, seen = [], set()
+    for cell in guarantor_cells:
+        pieces = []
+        for piece in re.split(r"[,;]", str(cell or "")):
+            # "Omega Holdings, LLC" is one guarantor, not two.
+            if pieces and _NAME_ENTITY_TAIL_RX.match(piece.strip()):
+                pieces[-1] = f"{pieces[-1]}, {piece.strip()}"
+            else:
+                pieces.append(piece)
+        for piece in pieces:
+            name = intro_person_name(piece)
+            if not name:
+                continue
+            tokens = [t for t in name.split() if not _NAME_ROMAN_RX.match(t)] or name.split()
+            key = (tokens[0].casefold(), tokens[-1].casefold())
+            if key not in seen:
+                seen.add(key)
+                names.append(name)
+    return names
+
+
+
+def join_intro_names(names) -> str:
+    """'A', 'A and B' (or 'A and B Surname' for a shared surname), 'A, B, and C'."""
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        first, second = names[0].split(), names[1].split()
+        if len(first) > 1 and len(second) > 1 and first[-1].casefold() == second[-1].casefold():
+            return f"{' '.join(first[:-1])} and {names[1]}"
+        return f"{names[0]} and {names[1]}"
+    if len(names) > 2:
+        return ", ".join(names[:-1]) + ", and " + names[-1]
+    return ""
+
+
+
+def term_intro_text(guarantor_cells) -> str:
+    names = join_intro_names(guarantor_intro_names(guarantor_cells))
+    return f"Asset Management review for term loans with {names}:" if names else "Asset Management review for term loans:"
+
+
+
+def _number_or_none(value: Any):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return None if pd.isna(value) else float(value)
+
+
+
+def bridge_loan_status(record: dict, today: date | None = None) -> str:
+    """'current' while a Bridge line has a balance or active assets (or was never drawn and is open), else 'prior'."""
+    if (_number_or_none(record.get("outstandingbalance")) or 0) > 0 or (_number_or_none(record.get("activeassets")) or 0) > 0:
+        return "current"
+    if (_number_or_none(record.get("totalfundedassets")) or 0) > 0 or (_number_or_none(record.get("lifetimefunded")) or 0) > 0:
+        return "prior"
+    maturity = record.get("linematuritydate")
+    if isinstance(maturity, datetime):
+        maturity = maturity.date()
+    if isinstance(maturity, date) and maturity < (today or date.today()):
+        return "prior"
+    return "current"
+
+
+
+def bridge_intro_text(statuses) -> str:
+    count, current = len(statuses), list(statuses).count("current")
+    if current and current < count:
+        label = "current and prior Bridge loans"
+    elif current:
+        label = "current Bridge loan" if count == 1 else "current Bridge loans"
+    else:
+        label = "prior Bridge loan" if count == 1 else "prior Bridge loans"
+    return f"Asset Management review for {label}:"
+
+
+
+def bridge_performance_text(statuses) -> str:
+    count, current = len(statuses), list(statuses).count("current")
+    if current and current < count:
+        return "Bridge loans have been performing as expected"
+    if current:
+        return "Bridge loan is performing as expected" if count == 1 else "Bridge loans are performing as expected"
+    return "Bridge loan performed as expected" if count == 1 else "Bridge loans performed as expected"
+
+
+
+def default_slide_intros(workbook_bytes: bytes) -> dict:
+    """The intro line each deck would carry, from the workbook's loan rows."""
+    intros = {}
+    term = read_sheet_for_slides(workbook_bytes, TERM_SHEET)
+    if term and term[1]:
+        intros[TERM_SHEET] = term_intro_text(r.get("guarantor") for r in sheet_records_by_key(term))
+    bridge = read_sheet_for_slides(workbook_bytes, BRIDGE_SHEET)
+    if bridge and bridge[1]:
+        intros[BRIDGE_SHEET] = bridge_intro_text([bridge_loan_status(r) for r in sheet_records_by_key(bridge)])
+    return intros
+
+
+
+def term_loans_paid_late(workbook_bytes: bytes) -> list[str]:
+    """Loans with a balance whose on-time payment rate is under 100%, against the commentary's 'no late or DQ payments'."""
+    term = read_sheet_for_slides(workbook_bytes, TERM_SHEET)
+    if not term:
+        return []
+    late = []
+    for record in sheet_records_by_key(term):
+        on_time = _number_or_none(record.get("historicalontimepayment%"))
+        balance = _number_or_none(record.get("outstandingbalance"))
+        if on_time is not None and on_time < 0.995 and (balance or 0) > 0:
+            late.append(f"{record.get('loanid')} ({on_time:.0%})")
+    return late
+
+
+
+# -------------------------
+# PowerPoint slide decks: building the decks
+# -------------------------
+def slide_template_names(kind: str):
+    return TERM_PPTX_TEMPLATE_NAMES if kind == TERM_SHEET else BRIDGE_PPTX_TEMPLATE_NAMES
+
+
+
+def slide_deck_file_name(kind: str, name: str, made_on: date) -> str:
+    """Named the way the AM team files them: 'Omega Realty Group AM Term Slide 10.19.2026.pptx'."""
+    return f"{sanitize_filename(name)} AM {kind} Slide {made_on.month}.{made_on.day}.{made_on.year}.pptx"
+
+
+
+def _placeholder(slide, idx: int):
+    for shape in slide.placeholders:
+        if shape.placeholder_format.idx == idx:
+            return shape
+    return None
+
+
+
+def _commentary_shape(slide):
+    """The commentary placeholder. Bridge templates also hold an empty text box of the same name."""
+    shape = _placeholder(slide, 1)
+    return shape if shape is not None and shape.has_text_frame and shape.text_frame.text.strip() else None
+
+
+
+def _legend_shape(slide, slide_width: int):
+    for shape in slide.placeholders:
+        if shape.has_text_frame and shape.text_frame.text.strip().lower().startswith("chart legend"):
+            return shape if shape.left < slide_width else None
+    return None
+
+
+
+def _commentary_height_emu(shape) -> int:
+    """Height of the commentary's visible text plus room for COMMENTARY_SPARE_LINES more bullets."""
+    inner = max(1, int(shape.width) - 3 * 91440)
+    lines = 0
+    for paragraph in shape.text_frame.paragraphs:
+        text = "".join(run.text for run in paragraph.runs).strip()
+        if text:
+            lines += text_line_count(text, inner, 12.0, False)
+    lines = max(lines, 1) + COMMENTARY_SPARE_LINES
+    return COMMENTARY_INSET_EMU + COMMENTARY_FIRST_LINE_EMU + COMMENTARY_NEXT_LINE_EMU * (lines - 1)
+
+
+
+def _set_intro_text(shape, text: str) -> int:
+    """
+    Writes the intro line and grows its box, as PowerPoint's own shape autofit
+    would, when the names run past one line. Returns the EMU added, which the
+    table below has to move down by.
+    """
+    _set_text_body(shape.text_frame._txBody, text)
+    run_props = shape.text_frame._txBody.find(".//" + qn("a:rPr"))
+    size = int(run_props.get("sz")) / 100.0 if run_props is not None and run_props.get("sz") else INTRO_FONT_PT
+    inner = max(1, int(shape.width) - 2 * 45720)
+    extra_lines = text_line_count(text, inner, size, False) - 1
+    if extra_lines <= 0:
+        return 0
+    grow = int(extra_lines * size * PPT_LINE_HEIGHT_PER_PT * EMU_PER_PT)
+    _pin_placeholder_geometry(shape)
+    shape.height = int(shape.height) + grow
+    return grow
+
+
+
+def _pin_placeholder_geometry(shape) -> None:
+    """
+    Copies a placeholder's position and size from its layout onto the slide.
+    A placeholder that inherits them has no xfrm of its own, and setting just
+    one dimension would create one with every other value zero.
+    """
+    left, top, width, height = shape.left, shape.top, shape.width, shape.height
+    shape.left, shape.top, shape.width, shape.height = left, top, width, height
+
+
+
+def _find_layout(prs, name: str):
+    for master in prs.slide_masters:
+        for layout in master.slide_layouts:
+            if layout.name.strip().lower() == name.lower():
+                return layout
+    return None
+
+
+
+def _add_table_slide(prs, frame_xml, layout):
+    """A new slide holding only a copy of the template's table."""
+    slide = prs.slides.add_slide(layout)
+    for placeholder in list(slide.placeholders):
+        placeholder._element.getparent().remove(placeholder._element)
+    frame = deepcopy(frame_xml)
+    frame.nvGraphicFramePr.cNvPr.id = slide.shapes._next_shape_id
+    slide.shapes._spTree.insert_element_before(frame, "p:extLst")
+    return next(s for s in slide.shapes if getattr(s, "has_table", False) and s.has_table)
+
+
+
+def _fill_table(tbl, rows) -> int:
+    """Replaces every row of tbl with rows = [(donor_tr, texts, height_emu)]; returns the table height."""
+    for tr in list(tbl.tr_lst):
+        tbl.remove(tr)
+    ext = tbl.find(qn("a:extLst"))
+    total_height = 0
+    for donor, texts, height in rows:
+        tr = deepcopy(donor)
+        tr.set("h", str(int(height)))
+        for tc, text in zip(tr.tc_lst, texts):
+            _set_text_body(tc.find(qn("a:txBody")), text)
+        if ext is not None:
+            ext.addprevious(tr)
+        else:
+            tbl.append(tr)
+        total_height += int(height)
+    return total_height
+
+
+
+def _strip_template_extras(prs) -> None:
+    """
+    Drops what the template would otherwise pass to every deck: the preview
+    picture, which still shows the template's sample rows, and PowerPoint's
+    co-authoring log of who edited the template.
+    """
+    try:
+        package_rels = prs.part.package._rels
+        for r_id, rel in list(package_rels.items()):
+            if rel.reltype == PPTX_RT.THUMBNAIL:
+                package_rels.pop(r_id)
+        for r_id, rel in list(prs.part.rels.items()):
+            if rel.reltype.endswith(("/changesInfo", "/revisionInfo")):
+                prs.part.drop_rel(r_id)
+    except Exception:
+        pass  # only these optional parts are at stake
+
+
+
+def _map_slide_columns(slide_headers, wb_headers):
+    """
+    The workbook column behind each slide column, matched by header name, and
+    the header text each slide column should show. Occupancy quarters pair up
+    in order and take the workbook's labels, since the template's are stale.
+    """
+    by_key = {slide_header_key(text): col for col, text in wb_headers.items()}
+    wb_occupancy = [col for col, text in wb_headers.items() if parse_occ_header(text)]
+    source_cols, labels, occupancy_seen = [], [], 0
+    for text in slide_headers:
+        if parse_occ_header(text):
+            col = wb_occupancy[occupancy_seen] if occupancy_seen < len(wb_occupancy) else None
+            occupancy_seen += 1
+            source_cols.append(col)
+            labels.append(wb_headers[col] if col else text)
+        else:
+            source_cols.append(by_key.get(slide_header_key(text)))
+            labels.append(text)
+    return source_cols, labels
+
+
+
+def build_slide_deck(kind: str, template_bytes: bytes, workbook_bytes: bytes, title_name: str, intro: str | None = None):
+    """
+    Fills the Term or Bridge slide template from the finished workbook, so the
+    slides show exactly what the Excel sheet shows. Returns the Presentation,
+    or None when that sheet has no loans.
+    """
+    sheet = read_sheet_for_slides(workbook_bytes, kind)
+    if sheet is None or not sheet[1]:
+        return None
+    wb_headers, wb_rows, wb_total = sheet
+
+    prs = Presentation(io.BytesIO(template_bytes))
+    slide = prs.slides[0]
+    table_shape = next((s for s in slide.shapes if getattr(s, "has_table", False) and s.has_table), None)
+    if table_shape is None:
+        raise ValueError(f"The {kind} slide template has no table.")
+    tbl = table_shape.table._tbl
+    header_tr, shaded_tr, plain_tr, total_tr = table_row_donors(tbl)
+    pristine_frame = deepcopy(table_shape._element)
+
+    source_cols, header_texts = _map_slide_columns([_tc_text(tc) for tc in header_tr.tc_lst], wb_headers)
+
+    def texts_for(row, blank):
+        return [format_slide_value(*row[col], blank=blank) if col in row else blank for col in source_cols]
+
+    body_texts = [texts_for(row, BLANK_CELL_PLACEHOLDER) for row in wb_rows]
+    total_texts = texts_for(wb_total, SLIDE_TOTAL_BLANK) if wb_total else None
+    # Bands run shaded, white, shaded... down the whole list, across slides.
+    body_donors = [shaded_tr if i % 2 == 0 else plain_tr for i in range(len(body_texts))]
+
+    # The template's sample rows are taller than one loan needs, so the
+    # shorter of them is the floor for every loan row.
+    min_body = min(int(shaded_tr.get("h", "0")), int(plain_tr.get("h", "0")))
+    grid = [_row_cells(header_tr, header_texts, int(header_tr.get("h", "0")))]
+    grid += [_row_cells(d, t, min_body) for d, t in zip(body_donors, body_texts)]
+    if total_texts:
+        grid.append(_row_cells(total_tr, total_texts, int(total_tr.get("h", "0"))))
+    widths = balance_column_widths([int(g.get("w")) for g in tbl.tblGrid.findall(qn("a:gridCol"))], grid)
+    for frame_tbl in (tbl, pristine_frame.find(".//" + qn("a:tbl"))):
+        for grid_col, width in zip(frame_tbl.tblGrid.findall(qn("a:gridCol")), widths):
+            grid_col.set("w", str(width))
+    heights = [row_height_emu(cells, widths) for cells in grid]
+    header_h, body_h = heights[0], heights[1 : 1 + len(body_texts)]
+    total_h = heights[-1] if total_texts else 0
+
+    title = slide.shapes.title
+    if title is not None:
+        heading = TERM_DECK_TITLE if kind == TERM_SHEET else BRIDGE_DECK_TITLE
+        _set_text_body(title.text_frame._txBody, f"{heading} \u2013 {str(title_name or '').strip()}")
+    table_top = SLIDE_TABLE_TOP_EMU
+    intro_shape = _placeholder(slide, 24)
+    if intro and intro.strip() and intro_shape is not None and intro_shape.has_text_frame:
+        table_top += _set_intro_text(intro_shape, intro.strip())
+
+    # Slide 0 keeps the commentary below the table and, on Term, clear of the
+    # chart legend; continuation slides carry the table alone.
+    commentary = _commentary_shape(slide)
+    legend = _legend_shape(slide, prs.slide_width)
+    text_floor = SLIDE_TEXT_FLOOR_EMU
+    if legend is not None:
+        legend_text_top = legend.top + (legend.height - LEGEND_TEXT_HEIGHT_EMU) // 2
+        text_floor = min(text_floor, legend_text_top - LEGEND_CLEARANCE_EMU)
+    table_floor = text_floor
+    if commentary is not None:
+        table_floor -= COMMENTARY_GAP_EMU + _commentary_height_emu(commentary)
+    pages = paginate_rows(
+        body_h,
+        header_h,
+        total_h,
+        table_floor - table_top,
+        CONT_SLIDE_TABLE_FLOOR_EMU - CONT_SLIDE_TABLE_TOP_EMU,
+    )
+
+    blank_layout = _find_layout(prs, "Blank") or slide.slide_layout
+    for page_no, page in enumerate(pages):
+        rows = [(header_tr, header_texts, header_h)]
+        rows += [(body_donors[i], body_texts[i], body_h[i]) for i in page]
+        if page_no == len(pages) - 1 and total_texts:
+            rows.append((total_tr, total_texts, total_h))
+        if page_no == 0:
+            shape = table_shape
+            shape.top = table_top
+        else:
+            shape = _add_table_slide(prs, pristine_frame, blank_layout)
+            shape.top = CONT_SLIDE_TABLE_TOP_EMU
+        shape.left = SLIDE_TABLE_LEFT_EMU
+        shape.height = _fill_table(shape.table._tbl, rows)
+        if page_no == 0 and commentary is not None:
+            _pin_placeholder_geometry(commentary)
+            commentary.top = shape.top + shape.height + COMMENTARY_GAP_EMU
+            # Stretch the box to the floor so bullets the analyst adds keep full size.
+            commentary.height = max(commentary.height, text_floor - commentary.top)
+
+    if kind == BRIDGE_SHEET and commentary is not None:
+        statuses = [bridge_loan_status(r) for r in sheet_records_by_key(sheet)]
+        for paragraph in commentary.text_frame.paragraphs:
+            if re.match(r"^\s*bridge loans?\b.*\bas expected\b", paragraph.text, re.IGNORECASE):
+                _set_paragraph_text(paragraph, bridge_performance_text(statuses))
+
+    _strip_template_extras(prs)
+    return prs
+
+
+
+def build_slide_deck_bytes(kind: str, workbook_bytes: bytes, title_name: str, intro: str | None, made_on: date):
+    """(pptx bytes, file name) for one deck, or None when the workbook has no loans of that kind."""
+    if Presentation is None:
+        raise RuntimeError("PowerPoint output needs the python-pptx package (pip install python-pptx).")
+    template_bytes = resolve_repo_file(slide_template_names(kind)).read_bytes()
+    prs = build_slide_deck(kind, template_bytes, workbook_bytes, title_name, intro)
+    if prs is None:
+        return None
+    output = io.BytesIO()
+    prs.save(output)
+    return output.getvalue(), slide_deck_file_name(kind, title_name, made_on)
+
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def slide_deck_download(kind: str, workbook_bytes: bytes, title_name: str, intro: str, made_on: date):
+    """build_slide_deck_bytes, kept across reruns so typing in the slide text box rebuilds only that deck."""
+    return build_slide_deck_bytes(kind, workbook_bytes, title_name, intro, made_on)
+
+
+
 def format_preview(df: pd.DataFrame, occ_headers) -> pd.DataFrame:
     preview = df.copy()
     occ_cols = [item["header"] for item in occ_headers] if occ_headers else []
@@ -3596,8 +4606,8 @@ def format_preview(df: pd.DataFrame, occ_headers) -> pd.DataFrame:
 st.set_page_config(page_title="AM Slides Builder", layout="wide")
 st.title("AM Slides Builder")
 st.caption(
-    "Build the AM Slides workbook from Salesforce plus a Berkadia Financial Analysis export, "
-    "a Midland CAF extract bundle, or both."
+    "Build the AM Slides workbook and the Term and Bridge PowerPoint slides from Salesforce plus "
+    "a Berkadia Financial Analysis export, a Midland CAF extract bundle, or both."
 )
 
 oauth_config = None
@@ -3629,6 +4639,14 @@ with st.sidebar:
     elif template_path is not None:
         st.success("Template found in repository")
         st.caption(template_path.name)
+    if Presentation is None:
+        st.warning("PowerPoint output is off: install python-pptx to get the slide decks.")
+    else:
+        for deck_kind in (TERM_SHEET, BRIDGE_SHEET):
+            try:
+                st.caption(f"{deck_kind} slide template: {resolve_repo_file(slide_template_names(deck_kind)).name}")
+            except RuntimeError:
+                st.warning(f"{deck_kind} slide template missing: add {slide_template_names(deck_kind)[0]} to the repository.")
 
     st.divider()
     st.header("Salesforce")
@@ -4092,6 +5110,21 @@ if st.button("Build completed AM slide", type="primary", disabled=build_disabled
         st.session_state["fci_alerts"] = fci_alerts
         st.session_state["fci_matches"] = fci_matches
 
+        # Starting text for the slide decks, editable below before download.
+        # A problem here must never cost the analyst the Excel workbook.
+        try:
+            slide_intros = default_slide_intros(workbook_bytes)
+            late_term_loans = term_loans_paid_late(workbook_bytes)
+        except Exception as exc:
+            slide_intros, late_term_loans = {}, []
+            st.warning(f"The workbook is ready, but the PowerPoint slides could not be prepared: {exc}")
+        st.session_state["deck_kinds"] = [kind for kind in (TERM_SHEET, BRIDGE_SHEET) if kind in slide_intros]
+        st.session_state["deck_default_name"] = slide_label
+        st.session_state["deck_title_name"] = slide_label
+        st.session_state["deck_term_intro"] = slide_intros.get(TERM_SHEET, "")
+        st.session_state["deck_bridge_intro"] = slide_intros.get(BRIDGE_SHEET, "")
+        st.session_state["late_term_loans"] = late_term_loans
+
         st.success("The AM slide workbook is ready.")
     except Exception as exc:
         st.error(str(normalize_salesforce_error(exc)))
@@ -4114,6 +5147,51 @@ if workbook_bytes:
         file_name=workbook_name,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+    deck_kinds = st.session_state.get("deck_kinds") or []
+    if deck_kinds and Presentation is None:
+        st.info("Install python-pptx (pip install python-pptx) to download the PowerPoint slides as well.")
+    elif deck_kinds:
+        with st.expander("PowerPoint slide text", expanded=False):
+            st.caption(
+                "The decks follow the AM templates. Change these before downloading if needed; "
+                "the commentary bullets are left as the template's standard wording."
+            )
+            st.text_input("Name in the slide titles", key="deck_title_name")
+            if TERM_SHEET in deck_kinds:
+                st.text_area(
+                    "Term slide intro",
+                    key="deck_term_intro",
+                    height=80,
+                    help="Built from the Guarantor column. Remove anyone who should not be named.",
+                )
+            if BRIDGE_SHEET in deck_kinds:
+                st.text_input("Bridge slide intro", key="deck_bridge_intro")
+        late_loans = st.session_state.get("late_term_loans") or []
+        if late_loans and TERM_SHEET in deck_kinds:
+            st.warning(
+                "The Term slide's commentary says there were no late or DQ payments, but these loans "
+                "show on-time payments under 100%: " + ", ".join(late_loans) + ". Adjust that bullet in PowerPoint."
+            )
+        deck_name = (st.session_state.get("deck_title_name") or "").strip() or st.session_state.get("deck_default_name", "")
+        for deck_kind, deck_column in zip(deck_kinds, st.columns(len(deck_kinds))):
+            intro_key = "deck_term_intro" if deck_kind == TERM_SHEET else "deck_bridge_intro"
+            try:
+                with st.spinner(f"Building the {deck_kind} slides..."):
+                    deck = slide_deck_download(
+                        deck_kind, workbook_bytes, deck_name, st.session_state.get(intro_key) or "", date.today()
+                    )
+            except Exception as exc:
+                deck_column.warning(f"The {deck_kind} slides could not be built: {exc}")
+                continue
+            if deck:
+                deck_column.download_button(
+                    f"Download {deck_kind} slides (PowerPoint)",
+                    data=deck[0],
+                    file_name=deck[1],
+                    mime=PPTX_MIME,
+                    key=f"download_{deck_kind.lower()}_deck",
+                )
 
 if isinstance(term_preview, pd.DataFrame) and not term_preview.empty:
     st.subheader("Term preview")
