@@ -221,6 +221,10 @@ LEGEND_CLEARANCE_EMU = 8 * EMU_PER_PT
 # Column widths: no column may be narrower than its widest unbreakable value
 # plus this, so a figure like $11,127,500 never splits across lines.
 COLUMN_FIT_SAFETY_EMU = 6350
+# The templates' cells have no side margins, so once columns are fitted to
+# their text, neighbouring values would touch ("5A-11521SUINUJ"). Each cell
+# keeps at least this much on either side, so values stay 3pt apart.
+CELL_SIDE_MARGIN_EMU = 19050
 COLUMN_WIDTH_STEP_EMU = 6350             # widths move 0.5pt at a time
 COLUMN_WIDTH_MAX_ROUNDS = 80
 # A continuation slide carries at least this many loans along with the Total.
@@ -3675,7 +3679,9 @@ def format_slide_value(value: Any, number_format: str, blank: str = BLANK_CELL_P
     if isinstance(value, bool):
         return "Yes" if value else "No"
     try:
-        number = Decimal(value) if isinstance(value, int) else Decimal(repr(float(value)))
+        # Excel works from 15 significant digits, so 0.08274999999999999
+        # (the mean of 7.80% and 8.75%) shows as 8.28%, not 8.27%.
+        number = Decimal(value) if isinstance(value, int) else Decimal(format(float(value), ".15g"))
     except (TypeError, ValueError, ArithmeticError):
         return str(value)
     if not number.is_finite():
@@ -3812,14 +3818,13 @@ def text_line_count(text: str, width_emu: int, size_pt: float, bold: bool) -> in
                     line_w, gap = 0.0, 0.0
                 if line_w == 0 and chunk_w > width_emu:
                     # Too wide for any line, so PowerPoint breaks it between
-                    # characters, not always where a greedy split would.
+                    # characters; the last piece stays on the current line.
                     for ch in chunk:
                         ch_w = _glyph_emu(ch, size_pt, bold)
                         if line_w > 0 and line_w + ch_w > width_emu:
                             lines += 1
                             line_w = 0.0
                         line_w += ch_w
-                    lines += 1
                 else:
                     line_w += gap + chunk_w
         total += lines
@@ -3905,6 +3910,19 @@ def _tr_without_shading(tr):
             fill.addprevious(tc_pr.makeelement(qn("a:noFill"), {}))
             tc_pr.remove(fill)
     return plain
+
+
+
+def _set_side_margins(tr, margin_emu: int) -> None:
+    """Gives every cell in the row at least margin_emu on the left and right."""
+    for tc in tr.tc_lst:
+        tc_pr = tc.find(qn("a:tcPr"))
+        if tc_pr is None:
+            tc_pr = tc.makeelement(qn("a:tcPr"), {})
+            tc.append(tc_pr)
+        for name in ("marL", "marR"):
+            if int(tc_pr.get(name, "91440")) < margin_emu:
+                tc_pr.set(name, str(margin_emu))
 
 
 
@@ -4075,27 +4093,45 @@ def balance_column_widths(widths, grid):
             trial_cols = [column(c, trial[c]) for c in range(n_cols)]
             trial_tops = tops_of(trial_cols)
             base = sum(max(floor[r], trial_tops[r][0]) for r in range(n_rows))
-            # Width each other column can give up without growing any row.
-            free = {}
+            # Width each other column can give up without growing any row:
+            # first what re-wraps none of its own cells, then what only
+            # re-wraps cells in rows that something else already makes taller.
+            # Taking the first kind first keeps short values such as
+            # "Term Loan" on one line.
+            tidy, free = {}, {}
             for c in range(n_cols):
                 if c == receiver:
                     continue
-                low, high = 0, max(0, (trial[c] - need[c]) // step)
-                while low < high:
-                    mid = (low + high + 1) // 2
-                    if height_with(trial_tops, c, column(c, trial[c] - mid * step)) <= base:
-                        low = mid
-                    else:
-                        high = mid - 1
-                if low:
-                    free[c] = low
+                limit = max(0, (trial[c] - need[c]) // step)
+                own = trial_cols[c]
+
+                def largest_cut(fits):
+                    low, high = 0, limit
+                    while low < high:
+                        mid = (low + high + 1) // 2
+                        if fits(column(c, trial[c] - mid * step)):
+                            low = mid
+                        else:
+                            high = mid - 1
+                    return low
+
+                loose = largest_cut(lambda col: height_with(trial_tops, c, col) <= base)
+                if loose:
+                    free[c] = loose
+                    tidy[c] = min(loose, largest_cut(lambda col: col == own))
             if sum(free.values()) < k:
                 continue
-            owed = k
-            for c in sorted(free, key=lambda d: (-free[d], d)):
-                take = min(free[c], owed)
-                trial[c] -= take * step
-                owed -= take
+            owed, taken = k, {}
+            for pool in (tidy, free):
+                for c in sorted(pool, key=lambda d: (-(pool[d] - taken.get(d, 0)), d)):
+                    take = min(pool[c] - taken.get(c, 0), owed)
+                    if take <= 0:
+                        continue
+                    trial[c] -= take * step
+                    taken[c] = taken.get(c, 0) + take
+                    owed -= take
+                    if owed == 0:
+                        break
                 if owed == 0:
                     break
             widths = trial
@@ -4148,11 +4184,16 @@ _NAME_NICKNAME_RX = re.compile(r"\s[\"\u201c'\u2018][^\s\"\u201d'\u2019]+[\"\u20
 _NAME_SUFFIX_RX = re.compile(r",?\s+(?:jr|sr)\.?$", re.IGNORECASE)
 _NAME_ROMAN_RX = re.compile(r"^(?:i{1,3}|iv|vi{0,3})$", re.IGNORECASE)
 _NAME_ENTITY_TAIL_RX = re.compile(r"^(?:l\.?l\.?c\.?|inc\.?|l\.?p\.?|l\.?l\.?p\.?|ltd\.?|corp\.?|co\.?)$", re.IGNORECASE)
+# Pieces after a comma that belong to the name before them: "Smith, Jr.", "Doe, III".
+_NAME_SUFFIX_PIECE_RX = re.compile(r"^(?:jr|sr)\.?$|^(?:i{1,3}|iv|vi{0,3})$", re.IGNORECASE)
+# Abbreviations that stay in capitals when an ALL-CAPS name is title-cased.
+_NAME_KEEP_UPPER_RX = re.compile(r"^(?:llc|lp|llp|lllp|reit|(?:[a-z]\.){2,})$", re.IGNORECASE)
 
 
 def _title_word(word: str) -> str:
+    """'O'NEAL' -> 'O'Neal', 'SMITH-JONES' -> 'Smith-Jones', '(PERSONAL)' -> '(Personal)'."""
     return "-".join(
-        "'".join(piece[:1].upper() + piece[1:].lower() for piece in part.split("'"))
+        "'".join(re.sub(r"[a-z]", lambda m: m.group(0).upper(), piece.lower(), count=1) for piece in part.split("'"))
         for part in word.split("-")
     )
 
@@ -4169,11 +4210,15 @@ def intro_person_name(raw: Any) -> str:
         return ""
     text = _NAME_NICKNAME_RX.sub(" ", f" {text} ")
     text = _NAME_SUFFIX_RX.sub("", re.sub(r"\s+", " ", text).strip())
+    text = re.sub(r",\s+(?=(?:i{1,3}|iv|vi{0,3})$)", " ", text, flags=re.IGNORECASE)
     parts = text.split(" ")
     if len(parts) > 2:
         parts = [parts[0]] + [p for p in parts[1:-1] if not re.fullmatch(r"[A-Za-z]\.", p)] + [parts[-1]]
     if text.upper() == text and any(ch.isalpha() for ch in text):
-        parts = [p.upper() if _NAME_ROMAN_RX.match(p) else _title_word(p) for p in parts]
+        parts = [
+            p.upper() if _NAME_ROMAN_RX.match(p) or _NAME_KEEP_UPPER_RX.match(p.rstrip(",")) else _title_word(p)
+            for p in parts
+        ]
     return " ".join(parts)
 
 
@@ -4184,8 +4229,8 @@ def guarantor_intro_names(guarantor_cells) -> list[str]:
     for cell in guarantor_cells:
         pieces = []
         for piece in re.split(r"[,;]", str(cell or "")):
-            # "Omega Holdings, LLC" is one guarantor, not two.
-            if pieces and _NAME_ENTITY_TAIL_RX.match(piece.strip()):
+            # "Omega Holdings, LLC" and "John Smith, Jr." are one guarantor, not two.
+            if pieces and (_NAME_ENTITY_TAIL_RX.match(piece.strip()) or _NAME_SUFFIX_PIECE_RX.match(piece.strip())):
                 pieces[-1] = f"{pieces[-1]}, {piece.strip()}"
             else:
                 pieces.append(piece)
@@ -4290,7 +4335,7 @@ def term_loans_paid_late(workbook_bytes: bytes) -> list[str]:
         on_time = _number_or_none(record.get("historicalontimepayment%"))
         balance = _number_or_none(record.get("outstandingbalance"))
         if on_time is not None and on_time < 0.995 and (balance or 0) > 0:
-            late.append(f"{record.get('loanid')} ({on_time:.0%})")
+            late.append(f"{record.get('loanid')} ({format_slide_value(on_time, '0%')})")
     return late
 
 
@@ -4420,16 +4465,22 @@ def _fill_table(tbl, rows) -> int:
 def _strip_template_extras(prs) -> None:
     """
     Drops what the template would otherwise pass to every deck: the preview
-    picture, which still shows the template's sample rows, and PowerPoint's
-    co-authoring log of who edited the template.
+    picture, which still shows the template's sample rows, PowerPoint's
+    co-authoring log of who edited the template, and its list of commenters
+    when no slide carries a comment.
     """
     try:
         package_rels = prs.part.package._rels
         for r_id, rel in list(package_rels.items()):
             if rel.reltype == PPTX_RT.THUMBNAIL:
                 package_rels.pop(r_id)
+        has_comments = any(
+            rel.reltype == PPTX_RT.COMMENTS for slide in prs.slides for rel in slide.part.rels.values()
+        )
         for r_id, rel in list(prs.part.rels.items()):
-            if rel.reltype.endswith(("/changesInfo", "/revisionInfo")):
+            if rel.reltype.endswith(("/changesInfo", "/revisionInfo")) or (
+                rel.reltype == PPTX_RT.COMMENT_AUTHORS and not has_comments
+            ):
                 prs.part.drop_rel(r_id)
     except Exception:
         pass  # only these optional parts are at stake
@@ -4476,7 +4527,10 @@ def build_slide_deck(kind: str, template_bytes: bytes, workbook_bytes: bytes, ti
         raise ValueError(f"The {kind} slide template has no table.")
     tbl = table_shape.table._tbl
     header_tr, shaded_tr, plain_tr, total_tr = table_row_donors(tbl)
+    for donor in (header_tr, shaded_tr, plain_tr, total_tr):
+        _set_side_margins(donor, CELL_SIDE_MARGIN_EMU)
     pristine_frame = deepcopy(table_shape._element)
+    records = sheet_records_by_key(sheet)
 
     source_cols, header_texts = _map_slide_columns([_tc_text(tc) for tc in header_tr.tc_lst], wb_headers)
 
@@ -4508,9 +4562,16 @@ def build_slide_deck(kind: str, template_bytes: bytes, workbook_bytes: bytes, ti
         heading = TERM_DECK_TITLE if kind == TERM_SHEET else BRIDGE_DECK_TITLE
         _set_text_body(title.text_frame._txBody, f"{heading} \u2013 {str(title_name or '').strip()}")
     table_top = SLIDE_TABLE_TOP_EMU
+    intro_text = (intro or "").strip()
+    if not intro_text:
+        # A cleared box must not leave the template's sample line behind.
+        if kind == TERM_SHEET:
+            intro_text = term_intro_text([])
+        else:
+            intro_text = bridge_intro_text([bridge_loan_status(r) for r in records])
     intro_shape = _placeholder(slide, 24)
-    if intro and intro.strip() and intro_shape is not None and intro_shape.has_text_frame:
-        table_top += _set_intro_text(intro_shape, intro.strip())
+    if intro_shape is not None and intro_shape.has_text_frame:
+        table_top += _set_intro_text(intro_shape, intro_text)
 
     # Slide 0 keeps the commentary below the table and, on Term, clear of the
     # chart legend; continuation slides carry the table alone.
@@ -4547,12 +4608,13 @@ def build_slide_deck(kind: str, template_bytes: bytes, workbook_bytes: bytes, ti
         shape.height = _fill_table(shape.table._tbl, rows)
         if page_no == 0 and commentary is not None:
             _pin_placeholder_geometry(commentary)
+            commentary.left = SLIDE_TABLE_LEFT_EMU  # bullets line up with the table
             commentary.top = shape.top + shape.height + COMMENTARY_GAP_EMU
             # Stretch the box to the floor so bullets the analyst adds keep full size.
             commentary.height = max(commentary.height, text_floor - commentary.top)
 
     if kind == BRIDGE_SHEET and commentary is not None:
-        statuses = [bridge_loan_status(r) for r in sheet_records_by_key(sheet)]
+        statuses = [bridge_loan_status(r) for r in records]
         for paragraph in commentary.text_frame.paragraphs:
             if re.match(r"^\s*bridge loans?\b.*\bas expected\b", paragraph.text, re.IGNORECASE):
                 _set_paragraph_text(paragraph, bridge_performance_text(statuses))
@@ -4604,6 +4666,12 @@ def format_preview(df: pd.DataFrame, occ_headers) -> pd.DataFrame:
 # Streamlit UI
 # -------------------------
 st.set_page_config(page_title="AM Slides Builder", layout="wide")
+# The slide text boxes sit below several st.stop() gates. A run that stops
+# before reaching them would otherwise drop what they hold, and the decks
+# would lose the analyst's edits; re-assigning the keys keeps them.
+for deck_text_key in ("deck_title_name", "deck_term_intro", "deck_bridge_intro"):
+    if deck_text_key in st.session_state:
+        st.session_state[deck_text_key] = st.session_state[deck_text_key]
 st.title("AM Slides Builder")
 st.caption(
     "Build the AM Slides workbook and the Term and Bridge PowerPoint slides from Salesforce plus "
