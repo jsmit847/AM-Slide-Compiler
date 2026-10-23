@@ -3,7 +3,6 @@ from __future__ import annotations
 import csv
 import io
 import json
-import os
 import re
 import base64
 import calendar
@@ -2920,19 +2919,16 @@ def iter_servicer_folder_files(folder: Path, max_depth: int = SERVICER_FOLDER_SE
     while directories:
         directory, depth = directories.pop()
         try:
-            # Keep the file attributes returned by directory enumeration. Path
-            # type checks would request them again for every file over the share.
-            with os.scandir(directory) as scan:
-                entries = list(scan)
+            entries = list(directory.iterdir())
         except OSError:
             continue
-        for entry in entries:
+        for item in entries:
             try:
-                if entry.is_dir():
+                if item.is_dir():
                     if depth < max_depth:
-                        directories.append((Path(entry.path), depth + 1))
-                elif entry.is_file():
-                    yield Path(entry.path)
+                        directories.append((item, depth + 1))
+                elif item.is_file():
+                    yield item
             except OSError:
                 continue
 
@@ -4878,7 +4874,7 @@ st.caption(
 
 midland_folder_bundles: list[bytes] = []
 midland_folder_picked = pd.DataFrame()
-with st.expander("Read Midland bundles straight from a folder", expanded=True):
+with st.expander("Read Midland bundles straight from a folder", expanded=False):
     st.caption(
         "Nothing is uploaded: the files are read from disk, so a whole network folder is fine. The "
         f"app takes one bundle per template quarter, the one dated about {CAF_RENT_ROLL_LAG_DAYS} "
