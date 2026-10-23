@@ -5223,6 +5223,7 @@ if workbook_bytes:
         data=workbook_bytes,
         file_name=workbook_name,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        on_click="ignore",
     )
 
     deck_kinds = st.session_state.get("deck_kinds") or []
@@ -5268,6 +5269,7 @@ if workbook_bytes:
                     file_name=deck[1],
                     mime=PPTX_MIME,
                     key=f"download_{deck_kind.lower()}_deck",
+                    on_click="ignore",
                 )
 
 if isinstance(term_preview, pd.DataFrame) and not term_preview.empty:
