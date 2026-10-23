@@ -27,6 +27,7 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from simple_salesforce import Salesforce
+from midland_folder_picker import upload_caf_folder
 
 try:
     from pptx import Presentation
@@ -644,6 +645,7 @@ def clear_salesforce_session() -> None:
         "deck_term_intro",
         "deck_bridge_intro",
         "late_term_loans",
+        "_midland_folder_upload",
     ]:
         st.session_state.pop(key, None)
 
@@ -4857,42 +4859,11 @@ with st.expander("Read the Berkadia tape straight from a folder", expanded=False
         except Exception as exc:
             st.error(str(exc))
 
-midland_files = st.file_uploader(
-    "Midland servicer folder",
-    type=["zip"],
-    key="midland_files",
-    accept_multiple_files="directory",
-    help=(
-        "Select the Midland folder itself. ZIP files in its subfolders are included. "
-        "Use the CAF extract .zip files exactly as downloaded, without pruning them. Each must "
-        "contain the RentRoll, LoanToProperty, Loan and AltAssetId extracts. AltAssetId supplies "
-        "the Investor Loan Number that ties a CAF loan to Salesforce, so occupancy lands on the "
-        "wrong loans without it."
-    ),
+midland_upload_bundles = upload_caf_folder(
+    target_quarters, parse_caf_bundle_date, pick_caf_bundles_for_quarters
 )
-midland_files = list(midland_files or [])
-if midland_files:
-    uploaded_bundles = {}
-    for uploaded_file in midland_files:
-        stamp = parse_caf_bundle_date(uploaded_file.name)
-        if stamp is not None:
-            uploaded_bundles.setdefault(Path(uploaded_file.name).name, (stamp, uploaded_file))
-    if not target_quarters:
-        st.warning("The template has no dated occupancy columns, so there is nothing to pick.")
-        midland_files = []
-    elif uploaded_bundles:
-        available_uploads = sorted(
-            uploaded_bundles.values(), key=lambda pair: (pair[0], Path(pair[1].name).name)
-        )
-        uploaded_picks = pick_caf_bundles_for_quarters(available_uploads, target_quarters)
-        midland_files = list(
-            {uploaded_file.name: uploaded_file for _stamp, uploaded_file in uploaded_picks.values()}.values()
-        )
-    else:
-        st.error("No bundles named like 'CAF_Extracts_MMDDYY_HHMM.zip' were found in the selected folder.")
-        midland_files = []
 st.caption(
-    "Select the whole Midland folder. The app chooses the CAF bundles needed for the template quarters."
+    "Select the whole Midland folder. Only the CAF bundles needed for the template quarters are uploaded."
 )
 
 midland_folder_bundles: list[bytes] = []
@@ -4952,7 +4923,7 @@ with st.expander("Read Midland bundles straight from a folder", expanded=True):
             except Exception as exc:
                 st.error(str(exc))
 
-midland_bundle_bytes = [item.getvalue() for item in midland_files] + midland_folder_bundles
+midland_bundle_bytes = midland_upload_bundles + midland_folder_bundles
 berkadia_tape_bytes = (
     [berkadia_file.getvalue()] if berkadia_file is not None else []
 ) + berkadia_folder_tapes
