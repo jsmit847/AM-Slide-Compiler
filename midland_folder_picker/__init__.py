@@ -1,6 +1,7 @@
 """Choose quarterly CAF archives before uploading them in bounded chunks."""
 
 import json
+import tempfile
 from pathlib import Path
 
 import streamlit as st
@@ -8,7 +9,8 @@ from streamlit.components.v1 import declare_component
 from streamlit.errors import StreamlitAPIException
 
 
-STATE_KEY = "_midland_folder_upload"
+STATE_KEY = "_midland_folder_upload_v2"
+WIDGET_KEY = "midland_folder_picker_v2"
 CHUNK_BYTES = 4 * 1024 * 1024
 _picker = declare_component(
     "midland_folder_upload", path=str(Path(__file__).parent / "frontend")
@@ -17,9 +19,23 @@ _picker = declare_component(
 
 def new_upload_state():
     return {
-        "request": None, "data": {}, "partial": bytearray(),
-        "complete": False, "last_event": None,
+        "request": None, "data": {}, "partial": 0, "directory": None,
+        "complete": False, "last_event": None, "notify_app": False,
     }
+
+
+def _release_files(state):
+    directory = state.get("directory")
+    if directory is not None:
+        directory.cleanup()
+
+
+def clear_caf_folder():
+    """Release this session's temporary archives on logout."""
+    state = st.session_state.pop(STATE_KEY, None)
+    if state:
+        _release_files(state)
+    st.session_state.pop("_midland_folder_upload", None)
 
 
 def _basename(name):
@@ -37,6 +53,7 @@ def apply_upload_event(
         event_id = event.get("id")
         if not isinstance(event_id, str) or not event_id or state["last_event"] == event_id:
             return False
+        _release_files(state)
         state.update(new_upload_state(), last_event=event_id)
         return True
     if isinstance(event, dict) and event.get("kind") == "manifest":
@@ -48,6 +65,7 @@ def apply_upload_event(
             "folder_name": "Midland", "total_files": 0,
             "chunk_size": chunk_size, "complete": False,
         }
+        _release_files(state)
         state.update(new_upload_state(), request=request, last_event=batch_id)
         try:
             manifest = event.get("files")
@@ -80,7 +98,10 @@ def apply_upload_event(
                 raise ValueError("A selected CAF bundle exceeds the app's per-file upload limit.")
             request["files"] = selected
             request["folder_name"] = names[0].replace("\\", "/").split("/")[0]
-        except ValueError as exc:
+            state["directory"] = tempfile.TemporaryDirectory(
+                prefix="am_midland_", ignore_cleanup_errors=True
+            )
+        except (ValueError, OSError) as exc:
             request["error"] = str(exc)
         return True
 
@@ -91,7 +112,8 @@ def apply_upload_event(
         if event.get("batch_id") != request["batch_id"]:
             return False
         request["error"] = str(event.get("message") or "The folder upload failed. Choose it again.")
-        state.update(data={}, partial=bytearray(), complete=False)
+        _release_files(state)
+        state.update(data={}, partial=0, directory=None, complete=False)
         return True
     if not isinstance(event, (bytes, bytearray)):
         return False
@@ -117,7 +139,7 @@ def apply_upload_event(
         next_file = next(item for item in request["files"] if item["name"] not in state["data"])
         if name != next_file["name"] or offset < 0 or offset >= total:
             raise ValueError("A CAF upload chunk arrived out of order. Choose the folder again.")
-        received = len(state["partial"])
+        received = state["partial"]
         content = event[4 + header_size:]
         expected_size = min(request["chunk_size"], total - offset)
         if len(content) != expected_size:
@@ -126,24 +148,30 @@ def apply_upload_event(
             return False
         if offset != received:
             raise ValueError("A CAF upload chunk arrived out of order. Choose the folder again.")
-        state["partial"].extend(content)
+        directory = state["directory"]
+        if directory is None:
+            raise ValueError("The upload session expired. Choose the folder again.")
+        path = Path(directory.name) / f"{request['files'].index(expected)}.zip"
+        if received and (not path.is_file() or path.stat().st_size != received):
+            raise ValueError("The upload session expired. Choose the folder again.")
+        with path.open("ab" if received else "wb") as handle:
+            handle.write(content)
         received += len(content)
+        state["partial"] = received
         request["ack"] = {"name": name, "offset": received}
         if received == total:
-            state["data"][name] = bytes(state["partial"])
-            state["partial"] = bytearray()
+            state["data"][name] = path
+            state["partial"] = 0
         state["complete"] = len(state["data"]) == len(request["files"])
         request["complete"] = state["complete"]
-    except (ValueError, UnicodeDecodeError) as exc:
+    except (ValueError, UnicodeDecodeError, OSError) as exc:
         request["error"] = str(exc)
-        state.update(data={}, partial=bytearray(), complete=False)
+        _release_files(state)
+        state.update(data={}, partial=0, directory=None, complete=False)
     return True
 
 
-def upload_caf_folder(quarter_keys, parse_date, choose_bundles):
-    """Keep binary widget messages below Cloud limits and return selected ZIPs."""
-    state = st.session_state.get(STATE_KEY) or new_upload_state()
-    event = _picker(request=state["request"], key="midland_folder_picker", default=None)
+def _upload_limits():
     chunk_size = CHUNK_BYTES
     for option in ("server.maxMessageSize", "server.maxWidgetStateSize"):
         try:
@@ -153,15 +181,48 @@ def upload_caf_folder(quarter_keys, parse_date, choose_bundles):
         if limit and limit > 0:
             chunk_size = min(chunk_size, max(1024, int(limit * 1_000_000 / 2)))
     max_file_bytes = int(st.get_option("server.maxUploadSize") * 1_000_000)
+    return chunk_size, max_file_bytes
+
+
+def _receive_upload(quarter_keys, parse_date, choose_bundles):
+    state = st.session_state.get(STATE_KEY) or new_upload_state()
+    event = st.session_state.get(WIDGET_KEY)
+    chunk_size, max_file_bytes = _upload_limits()
     changed = apply_upload_event(
         state, event, quarter_keys, parse_date, choose_bundles,
         max_file_bytes=max_file_bytes, chunk_size=chunk_size,
     )
-    st.session_state[STATE_KEY] = state
     if changed:
+        # Ordinary chunks only redraw the fragment. The rest of the app needs
+        # new data when a batch starts, finishes, is cleared, or fails.
+        kind = event.get("kind") if isinstance(event, dict) else None
+        if kind in ("manifest", "clear", "error") or state["complete"] or (
+            state["request"] and state["request"]["error"]
+        ):
+            state["notify_app"] = True
+    st.session_state[STATE_KEY] = state
+
+
+@st.fragment
+def _render_folder_picker(quarter_keys, parse_date, choose_bundles):
+    state = st.session_state.get(STATE_KEY) or new_upload_state()
+    st.session_state[STATE_KEY] = state
+    _picker(
+        request=state["request"], key=WIDGET_KEY, default=None,
+        on_change=lambda: _receive_upload(quarter_keys, parse_date, choose_bundles),
+    )
+    if state["notify_app"]:
+        state["notify_app"] = False
         st.rerun()
     if state["request"] and state["request"]["error"]:
         st.error(state["request"]["error"])
+
+
+def upload_caf_folder(quarter_keys, parse_date, choose_bundles):
+    """Show the folder picker and return selected archive paths once complete."""
+    st.session_state.pop("_midland_folder_upload", None)
+    _render_folder_picker(quarter_keys, parse_date, choose_bundles)
+    state = st.session_state[STATE_KEY]
     if state["complete"]:
         return [state["data"][item["name"]] for item in state["request"]["files"]]
     return []

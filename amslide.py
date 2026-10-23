@@ -26,7 +26,7 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from simple_salesforce import Salesforce
-from midland_folder_picker import upload_caf_folder
+from midland_folder_picker import clear_caf_folder, upload_caf_folder
 
 try:
     from pptx import Presentation
@@ -621,6 +621,7 @@ def clear_query_params() -> None:
 
 
 def clear_salesforce_session() -> None:
+    clear_caf_folder()
     for key in [
         "salesforce_auth",
         "account_candidates",
@@ -2138,10 +2139,16 @@ def find_sheet_name_case_insensitive(sheet_names, target_name: str):
 
 def detect_header_row_in_uploaded_sheet(ws, required_headers, scan_rows: int = 20, scan_cols: int = 80):
     required = {norm_hdr(x) for x in required_headers}
-    for r in range(1, min(ws.max_row, scan_rows) + 1):
-        row_vals = [norm_hdr(ws.cell(r, c).value) for c in range(1, min(ws.max_column, scan_cols) + 1)]
-        if required.issubset(set(row_vals)):
-            return r
+    if scan_rows > 0 and scan_cols > 0:
+        rows = ws.iter_rows(
+            min_row=1,
+            max_row=min(ws.max_row or scan_rows, scan_rows),
+            max_col=min(ws.max_column or scan_cols, scan_cols),
+            values_only=True,
+        )
+        for r, values in enumerate(rows, start=1):
+            if required.issubset({norm_hdr(value) for value in values}):
+                return r
     raise ValueError(
         f"Could not find a header row on '{ws.title}' containing {sorted(required_headers)} in the first {scan_rows} rows."
     )
@@ -2149,29 +2156,17 @@ def detect_header_row_in_uploaded_sheet(ws, required_headers, scan_rows: int = 2
 
 
 def load_financial_analysis_df_from_bytes(berkadia_bytes: bytes) -> pd.DataFrame:
-    xls = pd.ExcelFile(io.BytesIO(berkadia_bytes), engine="openpyxl")
-    sheet_name = find_sheet_name_case_insensitive(xls.sheet_names, "Financial Analysis")
-    if not sheet_name:
-        raise ValueError(
-            f"Could not find a sheet named 'Financial Analysis' (case-insensitive). Sheets found: {xls.sheet_names}"
-        )
-
-    workbook = load_workbook(io.BytesIO(berkadia_bytes), read_only=True, data_only=True)
-    try:
-        ws = workbook[sheet_name]
+    with pd.ExcelFile(io.BytesIO(berkadia_bytes), engine="openpyxl") as xls:
+        sheet_name = find_sheet_name_case_insensitive(xls.sheet_names, "Financial Analysis")
+        if not sheet_name:
+            raise ValueError(
+                f"Could not find a sheet named 'Financial Analysis' (case-insensitive). Sheets found: {xls.sheet_names}"
+            )
         header_row = detect_header_row_in_uploaded_sheet(
-            ws,
+            xls.book[sheet_name],
             required_headers=["Investor Loan#", "Freq of Analysis", "Period End Date", "Occupancy %"],
         )
-    finally:
-        workbook.close()
-
-    df = pd.read_excel(
-        io.BytesIO(berkadia_bytes),
-        sheet_name=sheet_name,
-        header=header_row - 1,
-        engine="openpyxl",
-    )
+        df = xls.parse(sheet_name=sheet_name, header=header_row - 1)
     df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed:")].copy()
     return df
 
@@ -2528,7 +2523,9 @@ def build_midland_occupancy_lookup(caf_zip_bundles, target_quarter_keys=None):
     alt_id_parts = []
     for position, bundle_bytes in enumerate(bundles, start=1):
         try:
-            archive = zipfile.ZipFile(io.BytesIO(bundle_bytes))
+            archive = zipfile.ZipFile(
+                bundle_bytes if isinstance(bundle_bytes, Path) else io.BytesIO(bundle_bytes)
+            )
         except zipfile.BadZipFile as exc:
             raise ValueError(
                 f"CAF bundle {position} of {len(bundles)} is not a readable .zip archive. Upload "
@@ -2777,9 +2774,9 @@ def build_midland_occupancy_lookup(caf_zip_bundles, target_quarter_keys=None):
     return lookup, selected_df, issues_df, rent_roll_rows_read
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=4)
 def load_midland_occupancy_lookup_cached(
-    caf_zip_bundles: tuple[bytes, ...], target_quarter_keys: tuple[str, ...]
+    caf_zip_bundles: tuple[bytes | Path, ...], target_quarter_keys: tuple[str, ...]
 ):
     return build_midland_occupancy_lookup(list(caf_zip_bundles), list(target_quarter_keys))
 
@@ -3091,7 +3088,7 @@ def build_berkadia_occupancy_lookup_multi(tape_bytes_list, target_quarter_keys=N
     return merged_lookup, merged_selected, merged_issues, rows_read
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=4)
 def load_berkadia_occupancy_lookup_cached(
     tape_bytes_list: tuple[bytes, ...], target_quarter_keys: tuple[str, ...]
 ):
@@ -4783,170 +4780,14 @@ berkadia_file = st.file_uploader(
     help="Use the servicer workbook that contains the Financial Analysis sheet.",
 )
 
-berkadia_folder_tapes: list[bytes] = []
-with st.expander("Read the Berkadia tape straight from a folder", expanded=False):
-    st.caption(
-        "Nothing is uploaded: the tape is read from disk. One tape's Financial Analysis sheet "
-        "already holds about three years of quarters, so the newest is normally enough. Older "
-        "tapes are only added if the template reaches back further than the newest one goes."
-    )
-    berkadia_folder = st.text_input(
-        "Folder holding the CoreVest_Data_Tape .xlsx files",
-        key="berkadia_folder",
-        placeholder=r"R:\Berkadia",
-    )
-    if berkadia_folder.strip():
-        try:
-            with st.spinner("Looking through the folder..."):
-                resolved_berkadia = resolve_servicer_folder(berkadia_folder)
-                tapes_available = list_berkadia_tapes_in_folder(resolved_berkadia)
-            if str(resolved_berkadia) != berkadia_folder.strip().strip('"'):
-                st.caption(f"Reading from {resolved_berkadia}")
-            chosen_tapes = [tapes_available[0]]
-            st.caption(
-                f"{len(tapes_available)} tapes in that folder; newest is "
-                f"{tapes_available[0][1].name} ({tapes_available[0][0].strftime('%m/%d/%Y')})."
-            )
-            with st.spinner(f"Reading {tapes_available[0][1].name}..."):
-                berkadia_folder_tapes = list(
-                    read_berkadia_tape_files(
-                        tuple((str(path), path.stat().st_size) for _stamp, path in chosen_tapes)
-                    )
-                )
-
-            # Reach further back only when the newest tape leaves a template
-            # quarter empty.
-            if target_quarters:
-                for stamp, path in tapes_available[1:]:
-                    probe, _sel, _iss, _rows = load_berkadia_occupancy_lookup_cached(
-                        tuple(berkadia_folder_tapes), target_quarters
-                    )
-                    still_missing = [q for q in target_quarters if not any(k[1] == q for k in probe)]
-                    if not still_missing:
-                        break
-                    if len(chosen_tapes) >= BERKADIA_MAX_TAPES_TO_POOL:
-                        st.caption(
-                            "Still no data for " + ", ".join(still_missing) + " after reading "
-                            f"{len(chosen_tapes)} tapes; stopping there."
-                        )
-                        break
-                    chosen_tapes.append((stamp, path))
-                    with st.spinner(f"Adding {path.name} for {', '.join(still_missing)}..."):
-                        berkadia_folder_tapes = list(
-                            read_berkadia_tape_files(
-                                tuple(
-                                    (str(item), item.stat().st_size)
-                                    for _d, item in chosen_tapes
-                                )
-                            )
-                        )
-
-            if len(chosen_tapes) > 1:
-                st.dataframe(
-                    pd.DataFrame(
-                        [
-                            {"Tape": path.name, "Tape date": stamp.strftime("%m/%d/%Y")}
-                            for stamp, path in chosen_tapes
-                        ]
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-        except Exception as exc:
-            st.error(str(exc))
-
-midland_folder_upload_bundles = upload_caf_folder(
+midland_bundle_bytes = upload_caf_folder(
     target_quarters, parse_caf_bundle_date, pick_caf_bundles_for_quarters
 )
-st.caption(
-    "Select the whole Midland folder. Only the ZIPs needed for the template quarters are uploaded."
-)
-
-with st.expander("Upload individual Midland ZIPs (optional)", expanded=False):
-    midland_files = st.file_uploader(
-        "Midland CAF extract bundles (.zip)",
-        type=["zip"],
-        key="midland_files",
-        accept_multiple_files=True,
-        help=(
-            "Use the CAF extract .zip files exactly as downloaded, without pruning them. Each must "
-            "contain the RentRoll, LoanToProperty, Loan and AltAssetId extracts. AltAssetId supplies "
-            "the Investor Loan Number that ties a CAF loan to Salesforce, so occupancy lands on the "
-            "wrong loans without it."
-        ),
-    )
-    midland_files = list(midland_files or [])
-
-midland_folder_bundles: list[bytes] = []
-midland_folder_picked = pd.DataFrame()
-with st.expander("Read Midland bundles straight from a folder", expanded=False):
-    st.caption(
-        "Nothing is uploaded: the files are read from disk, so a whole network folder is fine. The "
-        f"app takes one bundle per template quarter, the one dated about {CAF_RENT_ROLL_LAG_DAYS} "
-        "days after that quarter ended, which is when its rent rolls land."
-    )
-    midland_folder = st.text_input(
-        "Folder holding the CAF_Extracts .zip files",
-        key="midland_folder",
-        placeholder=r"R:\Midland",
-    )
-    if midland_folder.strip():
-        if not target_quarters:
-            st.warning("The template has no dated occupancy columns, so there is nothing to pick.")
-        else:
-            try:
-                with st.spinner("Looking through the folder..."):
-                    resolved_midland = resolve_servicer_folder(midland_folder)
-                    available = list_caf_bundles_in_folder(resolved_midland)
-                    picks = pick_caf_bundles_for_quarters(available, target_quarters)
-                if str(resolved_midland) != midland_folder.strip().strip('"'):
-                    st.caption(f"Reading from {resolved_midland}")
-                if not picks:
-                    st.warning("No bundle could be matched to a template quarter.")
-                else:
-                    midland_folder_picked = pd.DataFrame(
-                        [
-                            {
-                                "Quarter": quarter,
-                                "Bundle": path.name,
-                                "Bundle date": stamp.strftime("%m/%d/%Y"),
-                            }
-                            for quarter, (stamp, path) in picks.items()
-                        ]
-                    )
-                    st.caption(
-                        f"{len(available)} bundles in that folder; using {midland_folder_picked['Bundle'].nunique()} of them."
-                    )
-                    st.dataframe(
-                        midland_folder_picked, use_container_width=True, hide_index=True
-                    )
-
-                    unique_paths = []
-                    for _quarter, (_stamp, path) in picks.items():
-                        if path not in unique_paths:
-                            unique_paths.append(path)
-                    with st.spinner(f"Reading {len(unique_paths)} bundles from the folder..."):
-                        midland_folder_bundles = list(
-                            read_caf_bundle_files(
-                                tuple((str(path), path.stat().st_size) for path in unique_paths)
-                            )
-                        )
-            except Exception as exc:
-                st.error(str(exc))
-
-midland_bundle_bytes = (
-    midland_folder_upload_bundles
-    + [item.getvalue() for item in midland_files]
-    + midland_folder_bundles
-)
-berkadia_tape_bytes = (
-    [berkadia_file.getvalue()] if berkadia_file is not None else []
-) + berkadia_folder_tapes
+berkadia_tape_bytes = [berkadia_file.getvalue()] if berkadia_file is not None else []
 
 if not berkadia_tape_bytes and not midland_bundle_bytes:
     st.info(
-        "Add the Berkadia tape, the Midland CAF extract bundles, or both, to continue. Either can "
-        "be uploaded or read from a folder."
+        "Upload the Berkadia workbook, select the Midland folder, or add both to continue."
     )
     st.stop()
 
