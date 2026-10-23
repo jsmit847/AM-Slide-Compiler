@@ -26,7 +26,11 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from simple_salesforce import Salesforce
-from midland_folder_picker.uploader import clear_caf_folder, upload_caf_folder
+from midland_folder_picker.servicer_uploads import (
+    clear_servicer_uploads,
+    upload_berkadia_workbook,
+    upload_caf_folder,
+)
 
 try:
     from pptx import Presentation
@@ -621,7 +625,7 @@ def clear_query_params() -> None:
 
 
 def clear_salesforce_session() -> None:
-    clear_caf_folder()
+    clear_servicer_uploads()
     for key in [
         "salesforce_auth",
         "account_candidates",
@@ -4773,17 +4777,12 @@ st.caption(
     "overlap on a loan and quarter, Berkadia is used."
 )
 
-berkadia_file = st.file_uploader(
-    "Berkadia servicer file",
-    type=["xlsx", "xlsm"],
-    key="berkadia_file",
-    help="Use the servicer workbook that contains the Financial Analysis sheet.",
-)
+berkadia_file = upload_berkadia_workbook()
 
 midland_bundle_bytes = upload_caf_folder(
     target_quarters, parse_caf_bundle_date, pick_caf_bundles_for_quarters
 )
-berkadia_tape_bytes = [berkadia_file.getvalue()] if berkadia_file is not None else []
+berkadia_tape_bytes = [berkadia_file.read_bytes()] if berkadia_file is not None else []
 
 if not berkadia_tape_bytes and not midland_bundle_bytes:
     st.info(
