@@ -3,7 +3,6 @@ from __future__ import annotations
 import csv
 import io
 import json
-import os
 import re
 import base64
 import calendar
@@ -27,7 +26,6 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from simple_salesforce import Salesforce
-from midland_folder_picker import upload_caf_folder
 
 try:
     from pptx import Presentation
@@ -645,7 +643,6 @@ def clear_salesforce_session() -> None:
         "deck_term_intro",
         "deck_bridge_intro",
         "late_term_loans",
-        "_midland_folder_upload",
     ]:
         st.session_state.pop(key, None)
 
@@ -2922,19 +2919,16 @@ def iter_servicer_folder_files(folder: Path, max_depth: int = SERVICER_FOLDER_SE
     while directories:
         directory, depth = directories.pop()
         try:
-            # Keep the file attributes returned by directory enumeration. Path
-            # type checks would request them again for every file over the share.
-            with os.scandir(directory) as scan:
-                entries = list(scan)
+            entries = list(directory.iterdir())
         except OSError:
             continue
-        for entry in entries:
+        for item in entries:
             try:
-                if entry.is_dir():
+                if item.is_dir():
                     if depth < max_depth:
-                        directories.append((Path(entry.path), depth + 1))
-                elif entry.is_file():
-                    yield Path(entry.path)
+                        directories.append((item, depth + 1))
+                elif item.is_file():
+                    yield item
             except OSError:
                 continue
 
@@ -4859,16 +4853,28 @@ with st.expander("Read the Berkadia tape straight from a folder", expanded=False
         except Exception as exc:
             st.error(str(exc))
 
-midland_upload_bundles = upload_caf_folder(
-    target_quarters, parse_caf_bundle_date, pick_caf_bundles_for_quarters
+midland_files = st.file_uploader(
+    "Midland CAF extract bundles (.zip)",
+    type=["zip"],
+    key="midland_files",
+    accept_multiple_files=True,
+    help=(
+        "Use the CAF extract .zip files exactly as downloaded, without pruning them. Each must "
+        "contain the RentRoll, LoanToProperty, Loan and AltAssetId extracts. AltAssetId supplies "
+        "the Investor Loan Number that ties a CAF loan to Salesforce, so occupancy lands on the "
+        "wrong loans without it."
+    ),
 )
+midland_files = list(midland_files or [])
 st.caption(
-    "Select the whole Midland folder. Only the CAF bundles needed for the template quarters are uploaded."
+    "A CAF bundle holds only the most recent rent roll for each property, so one bundle fills one "
+    "quarter. To fill every quarter column, either upload one bundle per quarter or point the app "
+    "at the folder they live in and let it choose."
 )
 
 midland_folder_bundles: list[bytes] = []
 midland_folder_picked = pd.DataFrame()
-with st.expander("Read Midland bundles straight from a folder", expanded=True):
+with st.expander("Read Midland bundles straight from a folder", expanded=False):
     st.caption(
         "Nothing is uploaded: the files are read from disk, so a whole network folder is fine. The "
         f"app takes one bundle per template quarter, the one dated about {CAF_RENT_ROLL_LAG_DAYS} "
@@ -4923,7 +4929,7 @@ with st.expander("Read Midland bundles straight from a folder", expanded=True):
             except Exception as exc:
                 st.error(str(exc))
 
-midland_bundle_bytes = midland_upload_bundles + midland_folder_bundles
+midland_bundle_bytes = [item.getvalue() for item in midland_files] + midland_folder_bundles
 berkadia_tape_bytes = (
     [berkadia_file.getvalue()] if berkadia_file is not None else []
 ) + berkadia_folder_tapes
