@@ -26,7 +26,7 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from simple_salesforce import Salesforce
-from midland_folder_picker import clear_caf_folder, upload_caf_folder
+from midland_folder_picker.uploader import clear_caf_folder, upload_caf_folder
 
 try:
     from pptx import Presentation
