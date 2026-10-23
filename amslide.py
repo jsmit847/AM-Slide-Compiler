@@ -26,6 +26,7 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from simple_salesforce import Salesforce
+from midland_folder_upload import upload_midland_folder
 
 try:
     from pptx import Presentation
@@ -4853,23 +4854,12 @@ with st.expander("Read the Berkadia tape straight from a folder", expanded=False
         except Exception as exc:
             st.error(str(exc))
 
-midland_files = st.file_uploader(
-    "Midland CAF extract bundles (.zip)",
-    type=["zip"],
-    key="midland_files",
-    accept_multiple_files=True,
-    help=(
-        "Use the CAF extract .zip files exactly as downloaded, without pruning them. Each must "
-        "contain the RentRoll, LoanToProperty, Loan and AltAssetId extracts. AltAssetId supplies "
-        "the Investor Loan Number that ties a CAF loan to Salesforce, so occupancy lands on the "
-        "wrong loans without it."
-    ),
+midland_upload_bundles = upload_midland_folder(
+    target_quarters, parse_caf_bundle_date, pick_caf_bundles_for_quarters
 )
-midland_files = list(midland_files or [])
 st.caption(
-    "A CAF bundle holds only the most recent rent roll for each property, so one bundle fills one "
-    "quarter. To fill every quarter column, either upload one bundle per quarter or point the app "
-    "at the folder they live in and let it choose."
+    "Choose the whole Midland folder. The app checks the ZIP filenames first, then uploads "
+    "only the bundles needed for the template quarters."
 )
 
 midland_folder_bundles: list[bytes] = []
@@ -4929,7 +4919,7 @@ with st.expander("Read Midland bundles straight from a folder", expanded=False):
             except Exception as exc:
                 st.error(str(exc))
 
-midland_bundle_bytes = [item.getvalue() for item in midland_files] + midland_folder_bundles
+midland_bundle_bytes = midland_upload_bundles + midland_folder_bundles
 berkadia_tape_bytes = (
     [berkadia_file.getvalue()] if berkadia_file is not None else []
 ) + berkadia_folder_tapes
