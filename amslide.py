@@ -2785,7 +2785,8 @@ def load_midland_occupancy_lookup_cached(
 
 def parse_caf_bundle_date(file_name: str):
     """Reads the date out of a CAF_Extracts_MMDDYY_HHMM.zip file name."""
-    match = CAF_BUNDLE_NAME_RX.match(Path(file_name).name)
+    base_name = str(file_name).replace("\\", "/").rsplit("/", 1)[-1]
+    match = CAF_BUNDLE_NAME_RX.match(base_name)
     if not match:
         return None
     month, day, year = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
@@ -2987,6 +2988,21 @@ def pick_caf_bundles_for_quarters(bundles, quarter_keys, lag_days: int = CAF_REN
         target = quarter_end + timedelta(days=lag_days)
         chosen[quarter_key] = min(bundles, key=lambda pair: abs((pair[0] - target).days))
     return chosen
+
+
+def pick_uploaded_caf_bundles_for_quarters(uploaded_files, quarter_keys):
+    """Chooses template-quarter CAF bundles from a browser folder upload."""
+    bundles = {}
+    for uploaded_file in uploaded_files:
+        stamp = parse_caf_bundle_date(uploaded_file.name)
+        if stamp is not None:
+            bundles.setdefault(uploaded_file.name, (stamp, uploaded_file))
+    if not bundles:
+        raise ValueError(
+            "The selected folder has no bundles named like 'CAF_Extracts_MMDDYY_HHMM.zip'."
+        )
+    available = sorted(bundles.values(), key=lambda pair: (pair[0], pair[1].name))
+    return pick_caf_bundles_for_quarters(available, quarter_keys)
 
 
 def parse_berkadia_tape_date(file_name: str):
@@ -4770,7 +4786,7 @@ if occ_headers:
 else:
     st.caption("The Term template has no dated occupancy columns (e.g. '2024 Q1 Occ%'), so occupancy will be left blank.")
 st.caption(
-    "Read from a folder or upload files for whichever servicers cover this account. "
+    "Add the servicer files for this account. For Midland, you can upload the entire folder. "
     "Both feed the same quarter columns; where the two "
     "overlap on a loan and quarter, Berkadia is used."
 )
@@ -4856,9 +4872,56 @@ with st.expander("Read the Berkadia tape straight from a folder", expanded=False
 
 st.markdown("**Midland occupancy**")
 
+midland_directory_files = st.file_uploader(
+    "Upload the entire Midland servicer folder",
+    type=["zip"],
+    accept_multiple_files="directory",
+    key="midland_directory_files",
+    help=(
+        "Select your Midland folder. ZIP files in that folder and its subfolders are uploaded, "
+        "and the app automatically chooses the bundles needed for the template quarters."
+    ),
+)
+midland_directory_bundles: list[bytes] = []
+if midland_directory_files:
+    if not target_quarters:
+        st.warning("The template has no dated occupancy columns, so there is nothing to pick.")
+    else:
+        try:
+            uploaded_picks = pick_uploaded_caf_bundles_for_quarters(
+                midland_directory_files, target_quarters
+            )
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Quarter": quarter,
+                            "Bundle": uploaded_file.name,
+                            "Bundle date": stamp.strftime("%m/%d/%Y"),
+                        }
+                        for quarter, (stamp, uploaded_file) in uploaded_picks.items()
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+            selected_uploads = {
+                uploaded_file.name: uploaded_file
+                for _stamp, uploaded_file in uploaded_picks.values()
+            }
+            midland_directory_bundles = [
+                uploaded_file.getvalue() for uploaded_file in selected_uploads.values()
+            ]
+            st.caption(
+                f"{len(midland_directory_files)} ZIP files uploaded; "
+                f"using {len(selected_uploads)} bundles for the template quarters."
+            )
+        except Exception as exc:
+            st.error(str(exc))
+
 midland_folder_bundles: list[bytes] = []
 midland_folder_picked = pd.DataFrame()
-with st.expander("Read Midland bundles straight from a folder", expanded=True):
+with st.expander("Read Midland bundles straight from a folder", expanded=False):
     st.caption(
         "Paste the path to your whole Midland folder below. The app checks that folder and its "
         "archive subfolders, then reads only the bundles needed for the template quarters. It "
@@ -4918,7 +4981,7 @@ with st.expander("Read Midland bundles straight from a folder", expanded=True):
             except Exception as exc:
                 st.error(str(exc))
 
-with st.expander("Upload Midland ZIP files instead (optional)", expanded=False):
+with st.expander("Upload individual Midland ZIP files (optional)", expanded=False):
     midland_files = st.file_uploader(
         "Midland CAF extract bundles (.zip)",
         type=["zip"],
@@ -4933,11 +4996,15 @@ with st.expander("Upload Midland ZIP files instead (optional)", expanded=False):
     )
     st.caption(
         "A CAF bundle holds only the most recent rent roll for each property, so one bundle fills "
-        "one quarter. Select multiple ZIP files to cover all template quarters, or use the folder above."
+        "one quarter. Select multiple ZIP files to cover all template quarters."
     )
 midland_files = list(midland_files or [])
 
-midland_bundle_bytes = [item.getvalue() for item in midland_files] + midland_folder_bundles
+midland_bundle_bytes = (
+    midland_directory_bundles
+    + [item.getvalue() for item in midland_files]
+    + midland_folder_bundles
+)
 berkadia_tape_bytes = (
     [berkadia_file.getvalue()] if berkadia_file is not None else []
 ) + berkadia_folder_tapes
