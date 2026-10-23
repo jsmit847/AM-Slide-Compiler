@@ -4763,14 +4763,15 @@ except Exception as exc:
 st.session_state["occ_headers"] = occ_headers
 target_quarters = tuple(item["quarter_key"] for item in occ_headers)
 
-st.subheader("Step 2: Upload the servicer occupancy files")
+st.subheader("Step 2: Choose servicer occupancy files or folders")
 st.caption("The AM template workbook is loaded automatically from the repository. You do not need to upload it here.")
 if occ_headers:
     st.caption("Template occupancy quarters: " + ", ".join(target_quarters))
 else:
     st.caption("The Term template has no dated occupancy columns (e.g. '2024 Q1 Occ%'), so occupancy will be left blank.")
 st.caption(
-    "Upload whichever servicers cover this account. Both feed the same quarter columns; where the two "
+    "Read from a folder or upload files for whichever servicers cover this account. "
+    "Both feed the same quarter columns; where the two "
     "overlap on a loan and quarter, Berkadia is used."
 )
 
@@ -4853,37 +4854,25 @@ with st.expander("Read the Berkadia tape straight from a folder", expanded=False
         except Exception as exc:
             st.error(str(exc))
 
-midland_files = st.file_uploader(
-    "Midland CAF extract bundles (.zip)",
-    type=["zip"],
-    key="midland_files",
-    accept_multiple_files=True,
-    help=(
-        "Use the CAF extract .zip files exactly as downloaded, without pruning them. Each must "
-        "contain the RentRoll, LoanToProperty, Loan and AltAssetId extracts. AltAssetId supplies "
-        "the Investor Loan Number that ties a CAF loan to Salesforce, so occupancy lands on the "
-        "wrong loans without it."
-    ),
-)
-midland_files = list(midland_files or [])
-st.caption(
-    "A CAF bundle holds only the most recent rent roll for each property, so one bundle fills one "
-    "quarter. To fill every quarter column, either upload one bundle per quarter or point the app "
-    "at the folder they live in and let it choose."
-)
+st.markdown("**Midland occupancy**")
 
 midland_folder_bundles: list[bytes] = []
 midland_folder_picked = pd.DataFrame()
-with st.expander("Read Midland bundles straight from a folder", expanded=False):
+with st.expander("Read Midland bundles straight from a folder", expanded=True):
     st.caption(
-        "Nothing is uploaded: the files are read from disk, so a whole network folder is fine. The "
-        f"app takes one bundle per template quarter, the one dated about {CAF_RENT_ROLL_LAG_DAYS} "
+        "Paste the path to your whole Midland folder below. The app checks that folder and its "
+        "archive subfolders, then reads only the bundles needed for the template quarters. It "
+        f"takes one bundle per quarter, the one dated about {CAF_RENT_ROLL_LAG_DAYS} "
         "days after that quarter ended, which is when its rent rolls land."
     )
     midland_folder = st.text_input(
         "Folder holding the CAF_Extracts .zip files",
         key="midland_folder",
         placeholder=r"R:\Midland",
+        help=(
+            "Open the Midland folder in File Explorer and copy its address here. "
+            "The folder must be accessible to the computer running the app."
+        ),
     )
     if midland_folder.strip():
         if not target_quarters:
@@ -4928,6 +4917,25 @@ with st.expander("Read Midland bundles straight from a folder", expanded=False):
                         )
             except Exception as exc:
                 st.error(str(exc))
+
+with st.expander("Upload Midland ZIP files instead (optional)", expanded=False):
+    midland_files = st.file_uploader(
+        "Midland CAF extract bundles (.zip)",
+        type=["zip"],
+        key="midland_files",
+        accept_multiple_files=True,
+        help=(
+            "Use the CAF extract .zip files exactly as downloaded, without pruning them. Each must "
+            "contain the RentRoll, LoanToProperty, Loan and AltAssetId extracts. AltAssetId supplies "
+            "the Investor Loan Number that ties a CAF loan to Salesforce, so occupancy lands on the "
+            "wrong loans without it."
+        ),
+    )
+    st.caption(
+        "A CAF bundle holds only the most recent rent roll for each property, so one bundle fills "
+        "one quarter. Select multiple ZIP files to cover all template quarters, or use the folder above."
+    )
+midland_files = list(midland_files or [])
 
 midland_bundle_bytes = [item.getvalue() for item in midland_files] + midland_folder_bundles
 berkadia_tape_bytes = (
