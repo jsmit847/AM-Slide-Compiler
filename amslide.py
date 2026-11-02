@@ -3045,6 +3045,25 @@ def list_berkadia_tapes_in_folder(folder_path: str, include_subfolders: bool = T
 
 
 
+def quarters_older_tapes_can_fill(target_quarters, found_quarters) -> list:
+    """
+    Template quarters still worth looking for in older Berkadia tapes: the
+    missing ones older than the newest quarter already found. A quarter newer
+    than that has not been reported yet, and no older tape can have it, so
+    reading back for it would only slow the app down.
+    """
+    found = set(found_quarters)
+    ends = [end for end in (quarter_key_end_date(q) for q in found) if end is not None]
+    if not ends:
+        return [q for q in target_quarters if q not in found]
+    newest = max(ends)
+    return [
+        q for q in target_quarters
+        if q not in found and (quarter_key_end_date(q) or newest) < newest
+    ]
+
+
+
 def build_berkadia_occupancy_lookup_multi(tape_bytes_list, target_quarter_keys=None):
     """
     Runs the Berkadia reader over one or more tapes, newest first, and merges.
@@ -4813,14 +4832,14 @@ with st.expander("Read the Berkadia tape straight from a folder", expanded=False
                     )
                 )
 
-            # Reach further back only when the newest tape leaves a template
-            # quarter empty.
+            # Reach further back only when the newest tape leaves an older
+            # template quarter empty; one not reported yet can't be filled.
             if target_quarters:
                 for stamp, path in tapes_available[1:]:
                     probe, _sel, _iss, _rows = load_berkadia_occupancy_lookup_cached(
                         tuple(berkadia_folder_tapes), target_quarters
                     )
-                    still_missing = [q for q in target_quarters if not any(k[1] == q for k in probe)]
+                    still_missing = quarters_older_tapes_can_fill(target_quarters, {k[1] for k in probe})
                     if not still_missing:
                         break
                     if len(chosen_tapes) >= BERKADIA_MAX_TAPES_TO_POOL:
