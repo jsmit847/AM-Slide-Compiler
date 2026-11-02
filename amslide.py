@@ -230,6 +230,10 @@ COLUMN_WIDTH_STEP_EMU = 6350             # widths move 0.5pt at a time
 COLUMN_WIDTH_MAX_ROUNDS = 80
 # A continuation slide carries at least this many loans along with the Total.
 SLIDE_MIN_LAST_PAGE_ROWS = 3
+# PowerPoint tags each table row with an id (a16:rowId) that must be unique
+# within its table; rows copied from the template are renumbered from here.
+TABLE_ROW_ID_TAG = "{http://schemas.microsoft.com/office/drawing/2014/main}rowId"
+TABLE_ROW_ID_BASE = 1000000
 
 
 # -------------------------
@@ -644,6 +648,7 @@ def clear_salesforce_session() -> None:
         "deck_term_intro",
         "deck_bridge_intro",
         "late_term_loans",
+        "term_loans_without_guarantor",
     ]:
         st.session_state.pop(key, None)
 
@@ -757,88 +762,101 @@ def search_matching_accounts(sf: Salesforce, search_mode: str, query_text: str) 
 
 
 
-def find_contact_ref_field_on_deal_contact(sf: Salesforce):
-    description = sf.Deal_Contact__c.describe()
-    for field in description.get("fields", []):
-        if field.get("type") == "reference":
-            reference_to = field.get("referenceTo") or []
-            if any(str(item).lower() == "contact" for item in reference_to):
-                return field.get("name"), field.get("relationshipName")
-    return None, None
+def find_guarantor_fields(sf: Salesforce) -> dict:
+    """
+    Where this org keeps a deal's guarantors, read from its own schema.
+
+    A Deal_Contact__c row is a guarantor when a checkbox naming a guarantor
+    (Is_Guarantor__c) is ticked or a role picklist on it says Guarantor. Its
+    name can sit on a Contact lookup (a person) or an Account lookup (an
+    entity), so every such lookup is read, people first, then the row's own
+    Name, which is often an autonumber that the ID scrubbing throws away. Any
+    guarantor field on the Opportunity itself is the fallback for deals with
+    no guarantor rows.
+    """
+    contact_paths, account_paths, flags, picklists = [], [], [], []
+    for field in sf.Deal_Contact__c.describe().get("fields", []):
+        name = field.get("name") or ""
+        label = field.get("label") or ""
+        names_guarantor = "guarant" in name.lower() or "guarant" in label.lower()
+        field_type = field.get("type")
+        if field_type == "reference" and field.get("relationshipName"):
+            targets = [str(item).lower() for item in (field.get("referenceTo") or [])]
+            if "contact" in targets:
+                contact_paths.append(field["relationshipName"] + ".Name")
+            elif "account" in targets:
+                account_paths.append(field["relationshipName"] + ".Name")
+        elif field_type == "boolean" and names_guarantor and field.get("filterable", True):
+            flags.append(name)
+        elif field_type in ("picklist", "multipicklist") and field.get("filterable", True):
+            values = [
+                item.get("value")
+                for item in (field.get("picklistValues") or [])
+                if "guarant" in str(item.get("value") or "").lower()
+            ]
+            if values:
+                picklists.append((name, field_type, values))
+
+    opp_paths = []
+    for field in sf.Opportunity.describe().get("fields", []):
+        name = field.get("name") or ""
+        label = field.get("label") or ""
+        if "guarant" not in name.lower() and "guarant" not in label.lower():
+            continue
+        if field.get("type") == "reference" and field.get("relationshipName"):
+            opp_paths.append(field["relationshipName"] + ".Name")
+        elif field.get("type") in ("string", "picklist", "combobox", "textarea"):
+            opp_paths.append(name)
+
+    return {
+        "name_paths": contact_paths + account_paths + ["Name"],
+        "flags": flags or ["Is_Guarantor__c"],
+        "picklists": picklists,
+        "opp_paths": opp_paths,
+    }
 
 
 
-def query_deal_contacts_for_guarantors(sf: Salesforce, opportunity_ids: list[str]) -> pd.DataFrame:
+def first_guarantor_name(record: dict, paths) -> str:
+    """The first value along paths that reads as a name rather than an ID."""
+    for path in paths:
+        name = clean_guarantor_name(record_path_value(record, path))
+        if name:
+            return name
+    return ""
+
+
+
+def query_deal_contacts_for_guarantors(sf: Salesforce, opportunity_ids: list[str], fields: dict | None = None) -> pd.DataFrame:
     if not opportunity_ids:
         return pd.DataFrame(columns=[DC_DEAL_FIELD, "GuarantorName"])
 
-    _, contact_relationship_name = find_contact_ref_field_on_deal_contact(sf)
-    contact_name_path = (
-        f"{contact_relationship_name}.Name" if contact_relationship_name else None
-    )
-
-    fields = ["Id", DC_DEAL_FIELD, "Is_Guarantor__c", "Name"]
-    if contact_name_path:
-        fields.append(contact_name_path)
+    fields = fields or find_guarantor_fields(sf)
+    role_clauses = [f"{flag} = TRUE" for flag in fields["flags"]]
+    for name, field_type, values in fields["picklists"]:
+        quoted = ", ".join(soql_quote(value) for value in values)
+        role_clauses.append(f"{name} {'INCLUDES' if field_type == 'multipicklist' else 'IN'} ({quoted})")
+    select = ["Id", DC_DEAL_FIELD] + fields["name_paths"]
 
     rows: list[dict[str, Any]] = []
     for group in chunked(opportunity_ids, 150):
         ids_in = ", ".join(soql_quote(item) for item in group)
-        trial_fields = list(fields)
-        while True:
-            soql = (
-                "SELECT "
-                + ", ".join(trial_fields)
-                + " FROM Deal_Contact__c"
-                + f" WHERE {DC_DEAL_FIELD} IN ({ids_in})"
-                + " AND Is_Guarantor__c = TRUE"
-            )
-            try:
-                result = sf.query_all(soql)
-                rows.extend(result.get("records", []))
-                break
-            except Exception as exc:
-                message = str(exc)
-                missing_column = re.search(r"No such column '([^']+)'", message)
-                bad_relationship = re.search(r"Didn't understand relationship '([^']+)'", message)
+        found, _, _ = try_query_drop_missing(
+            sf,
+            "Deal_Contact__c",
+            list(dict.fromkeys(select)),
+            f"{DC_DEAL_FIELD} IN ({ids_in}) AND (" + " OR ".join(role_clauses) + ")",
+            limit=10000,
+        )
+        rows.extend(found)
 
-                if missing_column and missing_column.group(1) in trial_fields:
-                    trial_fields.remove(missing_column.group(1))
-                    continue
-
-                if bad_relationship:
-                    relbad = bad_relationship.group(1)
-                    to_drop = [
-                        field
-                        for field in trial_fields
-                        if field.startswith(relbad + ".") or (("." + relbad + ".") in field)
-                    ]
-                    if to_drop:
-                        for field in to_drop:
-                            trial_fields.remove(field)
-                        continue
-                raise
-
-    df = pd.DataFrame(rows).drop(columns=["attributes"], errors="ignore")
-    if df.empty:
-        return pd.DataFrame(columns=[DC_DEAL_FIELD, "GuarantorName"])
-
-    if contact_relationship_name and contact_relationship_name in df.columns:
-        df["ContactName"] = df[contact_relationship_name].apply(lambda x: (x or {}).get("Name"))
-    else:
-        df["ContactName"] = None
-
-    df["GuarantorName"] = df["ContactName"]
-    missing_mask = df["GuarantorName"].isna() | (df["GuarantorName"].astype(str).str.strip() == "")
-    df.loc[missing_mask, "GuarantorName"] = df.loc[missing_mask, "Name"]
-
+    names = [
+        {DC_DEAL_FIELD: record.get(DC_DEAL_FIELD), "GuarantorName": first_guarantor_name(record, fields["name_paths"])}
+        for record in rows
+    ]
+    df = pd.DataFrame(names, columns=[DC_DEAL_FIELD, "GuarantorName"])
     # Drop ID-like values so they never reach the slide.
-    df["GuarantorName"] = df["GuarantorName"].apply(clean_guarantor_name)
-    df = df[df["GuarantorName"] != ""].copy()
-    if df.empty:
-        return pd.DataFrame(columns=[DC_DEAL_FIELD, "GuarantorName"])
-
-    return df[[DC_DEAL_FIELD, "GuarantorName"]].copy()
+    return df[(df["GuarantorName"] != "") & df[DC_DEAL_FIELD].notna()].copy()
 
 
 
@@ -1111,14 +1129,18 @@ def build_term_bridge_for_where(sf: Salesforce, where_clause: str):
         "Servicer_Commitment_Id__c",
     ]
 
+    guarantor_fields = find_guarantor_fields(sf)
     rows, _, _ = try_query_drop_missing(
         sf,
         "Opportunity",
-        opportunity_fields,
+        opportunity_fields + guarantor_fields["opp_paths"],
         where_clause,
         limit=2000,
         order_by="CloseDate DESC NULLS LAST",
     )
+    deal_guarantors = {
+        record.get("Id"): first_guarantor_name(record, guarantor_fields["opp_paths"]) for record in rows
+    }
 
     df_all = pd.DataFrame(rows).drop(columns=["attributes"], errors="ignore")
     df_all = safe_flatten_recordtype(df_all)
@@ -1150,7 +1172,7 @@ def build_term_bridge_for_where(sf: Salesforce, where_clause: str):
 
     if not df_term_raw.empty:
         term_ids = df_term_raw["Id"].dropna().astype(str).unique().tolist()
-        df_contacts = query_deal_contacts_for_guarantors(sf, term_ids)
+        df_contacts = query_deal_contacts_for_guarantors(sf, term_ids, guarantor_fields)
         if not df_contacts.empty:
             guarantor_map = (
                 df_contacts.groupby(DC_DEAL_FIELD)["GuarantorName"]
@@ -1171,6 +1193,11 @@ def build_term_bridge_for_where(sf: Salesforce, where_clause: str):
             df_term_raw = df_term_raw.merge(guarantor_map, on="Id", how="left")
         else:
             df_term_raw["Guarantor"] = ""
+        # A deal with no guarantor rows can still name one on the deal itself.
+        df_term_raw["Guarantor"] = [
+            current if isinstance(current, str) and current.strip() else deal_guarantors.get(deal_id, "")
+            for current, deal_id in zip(df_term_raw["Guarantor"], df_term_raw["Id"])
+        ]
     else:
         df_term_raw["Guarantor"] = ""
 
@@ -4468,9 +4495,14 @@ def _fill_table(tbl, rows) -> int:
         tbl.remove(tr)
     ext = tbl.find(qn("a:extLst"))
     total_height = 0
-    for donor, texts, height in rows:
+    for row_no, (donor, texts, height) in enumerate(rows):
         tr = deepcopy(donor)
         tr.set("h", str(int(height)))
+        # Every copy of a template row would otherwise keep that row's id, and
+        # PowerPoint finds the cell being edited by row id: a Backspace typed
+        # in one row then deleted text in another.
+        for row_id in tr.iter(TABLE_ROW_ID_TAG):
+            row_id.set("val", str(TABLE_ROW_ID_BASE + row_no))
         for tc, text in zip(tr.tc_lst, texts):
             _set_text_body(tc.find(qn("a:txBody")), text)
         if ext is not None:
@@ -5201,6 +5233,11 @@ if st.button("Build completed AM slide", type="primary", disabled=build_disabled
         st.session_state["deck_term_intro"] = slide_intros.get(TERM_SHEET, "")
         st.session_state["deck_bridge_intro"] = slide_intros.get(BRIDGE_SHEET, "")
         st.session_state["late_term_loans"] = late_term_loans
+        st.session_state["term_loans_without_guarantor"] = [
+            str(row.get("Loan ID") or row.get("Loan") or "")
+            for _, row in term_rows_with_occ.iterrows()
+            if not clean_guarantor_name(row.get("Guarantor", ""))
+        ]
 
         st.success("The AM slide workbook is ready.")
     except Exception as exc:
@@ -5224,6 +5261,14 @@ if workbook_bytes:
         file_name=workbook_name,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+    no_guarantor = st.session_state.get("term_loans_without_guarantor") or []
+    if no_guarantor:
+        st.warning(
+            f"Salesforce has no guarantor on loan{'s' if len(no_guarantor) > 1 else ''} "
+            + ", ".join(no_guarantor)
+            + ", so the Guarantor cell shows '-'. Add the guarantor to the deal in Salesforce "
+            "and build again, or type the name into the slide."
+        )
 
     deck_kinds = st.session_state.get("deck_kinds") or []
     if deck_kinds and Presentation is None:
